@@ -563,6 +563,8 @@ impl TtlVaultContract {
                 release_condition: ReleaseCondition::OnExpiry,
                 parent_vault_id: None,
                 passkey_hash: None,
+                max_deposit_amount: None,
+                withdrawal_approval_threshold: None,
             };
             Self::save_vault(&env, vault_id, &vault);
             Self::add_owner_vault_id(&env, &owner, vault_id, check_in_interval);
@@ -589,9 +591,6 @@ impl TtlVaultContract {
             env.storage().persistent().set(&key, &vault_id);
             env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
             env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
-            
-            // Emit beneficiary assigned event - Issue #398
-            env.events().publish((BENEFICIARY_ASSIGNED_TOPIC, vault_id), beneficiary.clone());
             
             env.events().publish(
                 (VAULT_CREATED_TOPIC,),
@@ -702,6 +701,15 @@ impl TtlVaultContract {
         let now = env.ledger().timestamp();
         if now >= vault.last_check_in + vault.check_in_interval {
             panic_with_error!(&env, ContractError::VaultExpired);
+        }
+
+        // Check deposit limit - Issue #403
+        if let Some(max_deposit) = vault.max_deposit_amount {
+            let new_balance = vault.balance.checked_add(amount)
+                .unwrap_or_else(|| panic_with_error!(&env, ContractError::BalanceOverflow));
+            if new_balance > max_deposit {
+                panic_with_error!(&env, ContractError::DepositLimitExceeded);
+            }
         }
 
         // Use vault's token instead of default XLM
@@ -831,6 +839,14 @@ impl TtlVaultContract {
             if vault.balance < amount {
                 return Err(ContractError::InsufficientBalance);
             }
+
+            // Check withdrawal approval threshold - Issue #404
+            if let Some(threshold) = vault.withdrawal_approval_threshold {
+                if amount > threshold {
+                    return Err(ContractError::WithdrawalNotApproved);
+                }
+            }
+
             let token_client = token::Client::new(&env, &vault.token_address);
             token_client.transfer(&env.current_contract_address(), &vault.owner, &amount);
             vault.balance -= amount;
@@ -2587,6 +2603,9 @@ impl TtlVaultContract {
             is_paused: false,
             release_condition: ReleaseCondition::OnExpiry,
             parent_vault_id: Some(parent_vault_id),
+            passkey_hash: None,
+            max_deposit_amount: None,
+            withdrawal_approval_threshold: None,
         };
         
         Self::save_vault(&env, vault_id, &new_vault);
