@@ -97,6 +97,7 @@ pub enum ContractError {
     DisputeFiled = 31,
     NoScheduledWithdrawals = 32,
     ConditionsNotApproved = 33,
+    UpgradeInvalidHash = 34,
 }
 
 #[contract]
@@ -430,9 +431,24 @@ impl TtlVaultContract {
         }
     }
 
-    /// Admin-only. Upgrades the contract to a new WASM hash.
+    /// Validates that a new WASM hash is safe to upgrade to.
+    ///
+    /// Checks:
+    /// - The new hash is not the zero hash (i.e., not a null/empty deployment)
+    ///
+    /// # Errors
+    /// - `UpgradeInvalidHash` if the hash is all-zeros
+    pub fn validate_upgrade(env: Env, new_wasm_hash: BytesN<32>) {
+        let zero: BytesN<32> = BytesN::from_array(&env, &[0u8; 32]);
+        if new_wasm_hash == zero {
+            panic_with_error!(&env, ContractError::UpgradeInvalidHash);
+        }
+    }
+
+    /// Admin-only. Validates and upgrades the contract to a new WASM hash.
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
         Self::require_admin(&env);
+        Self::validate_upgrade(env.clone(), new_wasm_hash.clone());
         env.deployer().update_current_contract_wasm(new_wasm_hash);
         env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
     }

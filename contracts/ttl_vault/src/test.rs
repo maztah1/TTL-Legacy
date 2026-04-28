@@ -3037,3 +3037,44 @@ fn test_cannot_file_duplicate_dispute() {
     let result = client.try_file_dispute(&vault_id, &reason2);
     assert!(result.is_err());
 }
+
+// ---- Issue #424: Contract Upgrade Safety Checks ----
+
+#[test]
+fn test_validate_upgrade_rejects_zero_hash() {
+    let (env, _, _, _, _, client) = setup();
+    let zero_hash: BytesN<32> = BytesN::from_array(&env, &[0u8; 32]);
+    let result = client.try_validate_upgrade(&zero_hash);
+    assert_eq!(
+        result.unwrap_err().unwrap(),
+        soroban_sdk::Error::from_contract_error(34)
+    );
+}
+
+#[test]
+fn test_validate_upgrade_accepts_nonzero_hash() {
+    let (env, _, _, _, _, client) = setup();
+    let hash: BytesN<32> = BytesN::from_array(&env, &[1u8; 32]);
+    // Non-zero hash passes validation
+    client.validate_upgrade(&hash);
+}
+
+#[test]
+fn test_upgrade_requires_admin() {
+    let (env, _, _, _, _, client) = setup();
+    let hash: BytesN<32> = BytesN::from_array(&env, &[2u8; 32]);
+    env.set_auths(&[]);
+    let result = client.try_upgrade(&hash);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_upgrade_rejects_zero_hash() {
+    let (env, _, _, _, _, client) = setup();
+    let zero_hash: BytesN<32> = BytesN::from_array(&env, &[0u8; 32]);
+    let result = client.try_upgrade(&zero_hash);
+    assert_eq!(
+        result.unwrap_err().unwrap(),
+        soroban_sdk::Error::from_contract_error(34)
+    );
+}
