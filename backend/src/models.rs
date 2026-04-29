@@ -1,6 +1,105 @@
 use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
 
+// ── Notification models ──────────────────────────────────────────────────────
+
+/// Notification type sent to a device.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationType {
+    ExpiryWarning,
+    CheckInReminder,
+    VaultReleased,
+    VaultPaused,
+}
+
+/// Delivery status of a single notification attempt.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryStatus {
+    Pending,
+    Sent,
+    Failed,
+}
+
+/// A registered device push token.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceToken {
+    pub owner: String,
+    pub token: String,
+    /// "ios" | "android" | "web"
+    pub platform: String,
+    pub registered_at: DateTime<Utc>,
+}
+
+/// Per-owner notification preferences.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationPreferences {
+    pub owner: String,
+    pub expiry_warning_enabled: bool,
+    pub check_in_reminder_enabled: bool,
+    pub vault_released_enabled: bool,
+    /// Hours before expiry to send the warning (default 24).
+    pub warning_hours_before: u64,
+}
+
+impl Default for NotificationPreferences {
+    fn default() -> Self {
+        Self {
+            owner: String::new(),
+            expiry_warning_enabled: true,
+            check_in_reminder_enabled: true,
+            vault_released_enabled: true,
+            warning_hours_before: 24,
+        }
+    }
+}
+
+/// A scheduled notification (pending delivery).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduledNotification {
+    pub id: String,
+    pub vault_id: String,
+    pub owner: String,
+    pub notification_type: NotificationType,
+    /// Unix timestamp when this should fire.
+    pub scheduled_at: DateTime<Utc>,
+    pub status: DeliveryStatus,
+}
+
+/// Delivery record written after each send attempt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeliveryRecord {
+    pub notification_id: String,
+    pub vault_id: String,
+    pub owner: String,
+    pub notification_type: NotificationType,
+    pub status: DeliveryStatus,
+    pub sent_at: DateTime<Utc>,
+    /// FCM message ID on success, error string on failure.
+    pub provider_response: String,
+}
+
+/// Request body for `POST /notifications/register`.
+#[derive(Debug, Deserialize)]
+pub struct RegisterTokenRequest {
+    pub owner: String,
+    pub token: String,
+    pub platform: String,
+}
+
+/// Request body for `PUT /notifications/preferences`.
+#[derive(Debug, Deserialize)]
+pub struct UpdatePreferencesRequest {
+    pub owner: String,
+    pub expiry_warning_enabled: Option<bool>,
+    pub check_in_reminder_enabled: Option<bool>,
+    pub vault_released_enabled: Option<bool>,
+    pub warning_hours_before: Option<u64>,
+}
+
+// ── Existing models (unchanged) ──────────────────────────────────────────────
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Vault {
     pub id: String,
