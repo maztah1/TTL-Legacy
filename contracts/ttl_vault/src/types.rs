@@ -58,6 +58,11 @@ pub const MULTISIG_REJECTED_TOPIC: Symbol = symbol_short!("ms_rej");
 pub const MULTISIG_EXECUTED_TOPIC: Symbol = symbol_short!("ms_exec");
 pub const MULTISIG_PROPOSAL_EXPIRY: u64 = 604_800; // 7 days
 
+pub const META_VERSION_TOPIC: Symbol = symbol_short!("meta_ver");
+pub const META_REVERT_TOPIC: Symbol = symbol_short!("meta_rev");
+pub const VAULT_ARCHIVED_TOPIC: Symbol = symbol_short!("v_arch");
+pub const VAULT_CAP_TOPIC: Symbol = symbol_short!("v_cap");
+
 /// Warning threshold in seconds. If TTL remaining < this value, ping_expiry emits an event.
 pub const EXPIRY_WARNING_THRESHOLD: u64 = 86_400; // 24 hours
 
@@ -116,6 +121,8 @@ pub enum DataKey {
     MultiSigConfig(u64),
     MultiSigProposal(u64, u64),
     MultiSigProposalCount(u64),
+    MetadataHistory(u64),
+    OwnerVaultCount(Address),
 }
 
 /// A vesting schedule attached to a vault.
@@ -308,6 +315,16 @@ pub struct ActivityLogEntry {
 #[contracttype]
 #[derive(Clone)]
 pub struct ArchivedVaultInfo(pub Vault);
+
+/// A single metadata version snapshot - Issue #468
+#[contracttype]
+#[derive(Clone)]
+pub struct MetadataVersionEntry {
+    pub version: u32,
+    pub metadata: String,
+    pub updated_at: u64,
+    pub updated_by: Address,
+}
 
 /// Ownership transfer request
 #[contracttype]

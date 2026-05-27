@@ -27,6 +27,8 @@ use types::{
     MULTISIG_CONFIG_TOPIC, MULTISIG_PROPOSED_TOPIC, MULTISIG_APPROVED_TOPIC, MULTISIG_REJECTED_TOPIC,
     MULTISIG_EXECUTED_TOPIC, MULTISIG_PROPOSAL_EXPIRY, OWNERSHIP_INITIATED_TOPIC, OWNERSHIP_ACCEPTED_TOPIC,
     OWNERSHIP_CANCELLED_TOPIC,
+    MetadataVersionEntry, META_VERSION_TOPIC, META_REVERT_TOPIC, VAULT_ARCHIVED_TOPIC,
+    VAULT_CAP_TOPIC,
 };
 
 #[cfg(test)]
@@ -127,6 +129,10 @@ pub enum ContractError {
     ProposalExpired = 45,
     AlreadyApproved = 46,
     ProposalNotApproved = 47,
+    MetadataVersionNotFound = 48,
+    VaultCapacityExceeded = 49,
+    IncompatibleVaultToken = 50,
+    IncompatibleVaultStatus = 51,
 }
 
 #[contract]
@@ -579,6 +585,18 @@ impl TtlVaultContract {
 
             if owner == beneficiary {
                 panic_with_error!(&env, ContractError::InvalidBeneficiary);
+            }
+
+            // Issue #470: enforce per-owner vault capacity limit
+            let limit: u32 = env.storage()
+                .instance()
+                .get(&DataKey::OwnerVaultCount(env.current_contract_address()))
+                .unwrap_or(0u32);
+            if limit > 0 {
+                let current_count = Self::load_owner_vault_ids(&env, &owner).len() as u32;
+                if current_count >= limit {
+                    panic_with_error!(&env, ContractError::VaultCapacityExceeded);
+                }
             }
 
             // Use provided token or default to contract's XLM token
@@ -1163,6 +1181,13 @@ impl TtlVaultContract {
             }
             Self::save_vault(&env, vault_id, &vault);
             Self::append_activity_log(&env, vault_id, "trigger_release", &vault.owner, "");
+            // Issue #469: auto-archive vault after full release
+            if vault.status == ReleaseStatus::Released {
+                let arch_key = DataKey::ArchivedVault(vault_id);
+                env.storage().persistent().set(&arch_key, &ArchivedVaultInfo(vault.clone()));
+                env.storage().persistent().extend_ttl(&arch_key, VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
+                env.events().publish((VAULT_ARCHIVED_TOPIC, vault_id), (vault_id, ReleaseStatus::Released));
+            }
             env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
         }
     }
@@ -3433,10 +3458,10 @@ impl TtlVaultContract {
                 return Err(ContractError::NotOwner);
             }
             if source.token_address != target.token_address {
-                return Err(ContractError::InvalidAmount);
+                return Err(ContractError::IncompatibleVaultToken);
             }
             if source.status != ReleaseStatus::Locked {
-                return Err(ContractError::AlreadyReleased);
+                return Err(ContractError::IncompatibleVaultStatus);
             }
         }
 
@@ -3460,8 +3485,6 @@ impl TtlVaultContract {
         env.events().publish((VAULT_MERGED_TOPIC,), (target_vault_id, source_vault_ids));
         Ok(())
     }
-
-    // --- Issue #386: Vault Expiry Notification Events ---
 
     /// Emits expiry warning events for vaults with TTL < 7 days.
     ///
@@ -4524,6 +4547,172 @@ impl TtlVaultContract {
         let raw = value.to_le_bytes();
         Bytes::from_array(&env, &raw)
     }
+
+    // ── Internal withdraw helper (shared by withdraw + multisig execute) ─────
+
+    // ── Issue #468: Vault Metadata Versioning ────────────────────────────────
+
+    /// Updates vault metadata and records the change in version history.
+    ///
+    /// Each call snapshots the previous metadata as a versioned entry, allowing
+    /// callers to retrieve history or revert to a prior version.
+    ///
+    /// # Arguments
+    /// * `vault_id` - The vault to update
+    /// * `caller`   - Must be the vault owner
+    /// * `new_metadata` - New metadata string (max 256 chars)
+    pub fn update_metadata_versioned(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        new_metadata: String,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        Self::assert_metadata_len(&env, &new_metadata);
+        let mut vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if vault.status != ReleaseStatus::Locked {
+            return Err(ContractError::AlreadyReleased);
+        }
+
+        let key = DataKey::MetadataHistory(vault_id);
+        let mut history: Vec<MetadataVersionEntry> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let version = history.len() as u32 + 1;
+        history.push_back(MetadataVersionEntry {
+            version,
+            metadata: vault.metadata.clone(),
+            updated_at: env.ledger().timestamp(),
+            updated_by: caller.clone(),
+        });
+
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&key, &history);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+
+        vault.metadata = new_metadata.clone();
+        Self::save_vault(&env, vault_id, &vault);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((META_VERSION_TOPIC, vault_id), (version, new_metadata));
+        Ok(())
+    }
+
+    /// Returns the full metadata version history for a vault.
+    pub fn get_metadata_history(env: Env, vault_id: u64) -> Vec<MetadataVersionEntry> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MetadataHistory(vault_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Reverts vault metadata to a specific historical version.
+    ///
+    /// # Arguments
+    /// * `vault_id` - The vault to revert
+    /// * `caller`   - Must be the vault owner
+    /// * `version`  - 1-based version number to revert to
+    pub fn revert_metadata(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        version: u32,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let mut vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if vault.status != ReleaseStatus::Locked {
+            return Err(ContractError::AlreadyReleased);
+        }
+
+        let key = DataKey::MetadataHistory(vault_id);
+        let history: Vec<MetadataVersionEntry> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // version is 1-based; find the matching entry
+        let mut target_metadata: Option<String> = None;
+        for entry in history.iter() {
+            if entry.version == version {
+                target_metadata = Some(entry.metadata.clone());
+                break;
+            }
+        }
+
+        let reverted = target_metadata.ok_or(ContractError::MetadataVersionNotFound)?;
+        vault.metadata = reverted.clone();
+        Self::save_vault(&env, vault_id, &vault);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((META_REVERT_TOPIC, vault_id), (version, reverted));
+        Ok(())
+    }
+
+    // ── Issue #469: Vault Archival Automation ─────────────────────────────────
+
+    /// Archives a released vault by storing a snapshot for historical queries.
+    ///
+    /// Called automatically after `trigger_release` completes, or manually by
+    /// the owner/admin. Stores the vault state under `ArchivedVault(vault_id)`.
+    ///
+    /// # Arguments
+    /// * `vault_id` - The vault to archive (must be Released or Cancelled)
+    /// * `caller`   - Must be the vault owner or admin
+    pub fn archive_vault(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        // Only owner or admin may archive
+        let admin = Self::load_admin(&env);
+        if caller != vault.owner && caller != admin {
+            return Err(ContractError::NotOwner);
+        }
+        if vault.status == ReleaseStatus::Locked {
+            return Err(ContractError::NotExpired);
+        }
+
+        let key = DataKey::ArchivedVault(vault_id);
+        env.storage().persistent().set(&key, &ArchivedVaultInfo(vault.clone()));
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((VAULT_ARCHIVED_TOPIC, vault_id), (vault_id, vault.status));
+        Ok(())
+    }
+
+    // ── Issue #470: Vault Capacity Limits ────────────────────────────────────
+
+    /// Sets the maximum number of active vaults an owner may hold.
+    ///
+    /// Admin-only. A value of 0 removes the limit.
+    pub fn set_owner_vault_limit(env: Env, limit: u32) {
+        Self::require_admin(&env);
+        env.storage().instance().set(&DataKey::OwnerVaultCount(env.current_contract_address()), &limit);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((VAULT_CAP_TOPIC,), limit);
+    }
+
+    /// Returns the configured per-owner vault limit (0 = unlimited).
+    pub fn get_owner_vault_limit(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::OwnerVaultCount(env.current_contract_address()))
+            .unwrap_or(0u32)
+    }
+
+    // ── Issue #471: Vault Merge Validation ───────────────────────────────────
+
+    // (merge_vaults already exists; enhanced validation is applied inline above)
 
     // ── Internal withdraw helper (shared by withdraw + multisig execute) ─────
 
