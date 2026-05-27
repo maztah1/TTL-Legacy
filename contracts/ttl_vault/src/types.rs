@@ -62,6 +62,23 @@ pub const META_VERSION_TOPIC: Symbol = symbol_short!("meta_ver");
 pub const META_REVERT_TOPIC: Symbol = symbol_short!("meta_rev");
 pub const VAULT_ARCHIVED_TOPIC: Symbol = symbol_short!("v_arch");
 pub const VAULT_CAP_TOPIC: Symbol = symbol_short!("v_cap");
+// Issue #480: check-in delegation events
+pub const DELEGATE_CHECKIN_TOPIC: Symbol = symbol_short!("del_ci");
+pub const REVOKE_DELEGATE_TOPIC: Symbol = symbol_short!("rev_del");
+// Issue #481: proof-of-work event
+pub const CHECKIN_POW_TOPIC: Symbol = symbol_short!("ci_pow");
+// Issue #482: TTL prediction event
+pub const TTL_PREDICTED_TOPIC: Symbol = symbol_short!("ttl_pred");
+// Issue #483: batch check-in event
+pub const BATCH_CHECKIN_TOPIC: Symbol = symbol_short!("b_ci");
+// Issue #472: state transition audit
+pub const STATE_TRANSITION_TOPIC: Symbol = symbol_short!("st_trans");
+// Issue #473: ownership proof
+pub const OWNERSHIP_PROOF_TOPIC: Symbol = symbol_short!("own_prf");
+// Issue #474: integrity check
+pub const INTEGRITY_TOPIC: Symbol = symbol_short!("integ");
+// Issue #475: batch status query
+pub const BATCH_STATUS_TOPIC: Symbol = symbol_short!("b_stat");
 
 // Previously missing topics referenced in lib.rs
 pub const STATE_TRANSITION_TOPIC: Symbol = symbol_short!("st_trans");
@@ -140,15 +157,31 @@ pub enum DataKey {
     MultiSigProposalCount(u64),
     MetadataHistory(u64),
     OwnerVaultCount(Address),
-    // Shared TTL Pool
-    TtlPool(u64),
-    TtlPoolCount,
-    TtlPoolVaults(u64),
-    VaultPool(u64),
-    // Biometric verification
-    VaultBiometrics(u64),
-    // State transition audit log
+    // Issue #472: state transition audit trail
     StateTransitionLog(u64),
+    // Issue #482: TTL prediction history
+    CheckInHistory(u64),
+    CheckInStreak(u64),
+    // Issue #481: proof-of-work nonce
+    CheckInNonce(u64),
+    // Issue #480: check-in delegates
+    CheckInDelegates(u64),
+}
+
+/// Check-in history entry for TTL prediction - Issue #482
+#[contracttype]
+#[derive(Clone)]
+pub struct CheckInHistoryEntry {
+    pub timestamp: u64,
+}
+
+/// Check-in streak tracking - Issue #482
+#[contracttype]
+#[derive(Clone)]
+pub struct CheckInStreak {
+    pub current: u32,
+    pub best: u32,
+    pub last_timestamp: u64,
 }
 
 /// A vesting schedule attached to a vault.

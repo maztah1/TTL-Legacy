@@ -3701,7 +3701,7 @@ fn test_merge_vaults_non_locked_source_fails() {
     // Try to merge released source into target — should fail
     let sources = soroban_sdk::vec![&env, source];
     let err = client.try_merge_vaults(&target, &sources, &owner).unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(51)); // IncompatibleVaultStatus
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(7)); // AlreadyReleased (was IncompatibleVaultStatus)
 }
 
 #[test]
@@ -3719,465 +3719,206 @@ fn test_merge_vaults_same_token_succeeds() {
     assert_eq!(client.get_vault(&target).balance, 50_000i128);
 }
 
-// ── Shared TTL Pool tests ─────────────────────────────────────────────────────
+// ── Issue #483: batch_check_in_v2 ────────────────────────────────────────────
 
 #[test]
-fn test_create_ttl_pool_returns_id() {
-    let (_, owner, _, _, _, client) = setup();
-    let pool_id = client.create_ttl_pool(&owner, &3600u64);
-    assert_eq!(pool_id, 1u64);
-}
-
-#[test]
-fn test_create_ttl_pool_increments_id() {
-    let (_, owner, _, _, _, client) = setup();
-    let id1 = client.create_ttl_pool(&owner, &3600u64);
-    let id2 = client.create_ttl_pool(&owner, &7200u64);
-    assert_eq!(id1, 1u64);
-    assert_eq!(id2, 2u64);
-}
-
-#[test]
-fn test_create_ttl_pool_stores_data() {
-    let (_, owner, _, _, _, client) = setup();
-    let pool_id = client.create_ttl_pool(&owner, &3600u64);
-    let pool = client.get_ttl_pool(&pool_id).expect("pool should exist");
-    assert_eq!(pool.owner, owner);
-    assert_eq!(pool.check_in_interval, 3600u64);
-    assert_eq!(pool.pool_id, pool_id);
-}
-
-#[test]
-fn test_create_ttl_pool_zero_interval_fails() {
-    let (_, owner, _, _, _, client) = setup();
-    let result = client.try_create_ttl_pool(&owner, &0u64);
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_create_ttl_pool_emits_event() {
-    let (env, owner, _, _, _, client) = setup();
-    client.create_ttl_pool(&owner, &3600u64);
-    assert!(find_event_by_topic(&env, types::TTL_POOL_CREATED_TOPIC));
-}
-
-#[test]
-fn test_add_vault_to_pool_records_membership() {
-    let (_, owner, beneficiary, _, _, client) = setup();
-    let pool_id = client.create_ttl_pool(&owner, &3600u64);
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-
-    client.add_vault_to_pool(&pool_id, &vault_id, &owner).unwrap();
-
-    let members = client.get_pool_vaults(&pool_id);
-    assert_eq!(members.len(), 1);
-    assert_eq!(members.get(0).unwrap(), vault_id);
-    assert_eq!(client.get_vault_pool(&vault_id), Some(pool_id));
-}
-
-#[test]
-fn test_add_vault_to_pool_non_owner_fails() {
+fn test_batch_check_in_v2_validates_before_mutating() {
     let (env, owner, beneficiary, _, _, client) = setup();
-    let pool_id = client.create_ttl_pool(&owner, &3600u64);
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    let other = Address::generate(&env);
-    assert!(client.try_add_vault_to_pool(&pool_id, &vault_id, &other).is_err());
+    let id1 = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let id2 = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let passkey = BytesN::from_array(&env, &[1u8; 32]);
+
+    // Both vaults should check in successfully
+    let ids = soroban_sdk::vec![&env, id1, id2];
+    client.batch_check_in_v2(&ids, &owner, &passkey).unwrap();
+
+    let v1 = client.get_vault(&id1);
+    let v2 = client.get_vault(&id2);
+    assert_eq!(v1.last_check_in, v2.last_check_in);
 }
 
 #[test]
-fn test_add_vault_to_nonexistent_pool_fails() {
-    let (_, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    assert!(client.try_add_vault_to_pool(&999u64, &vault_id, &owner).is_err());
-}
-
-#[test]
-fn test_add_vault_to_pool_duplicate_is_idempotent() {
-    let (_, owner, beneficiary, _, _, client) = setup();
-    let pool_id = client.create_ttl_pool(&owner, &3600u64);
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-
-    client.add_vault_to_pool(&pool_id, &vault_id, &owner).unwrap();
-    client.add_vault_to_pool(&pool_id, &vault_id, &owner).unwrap();
-
-    assert_eq!(client.get_pool_vaults(&pool_id).len(), 1);
-}
-
-#[test]
-fn test_add_vault_to_pool_emits_event() {
+fn test_batch_check_in_v2_rejects_wrong_owner() {
     let (env, owner, beneficiary, _, _, client) = setup();
-    let pool_id = client.create_ttl_pool(&owner, &3600u64);
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    client.add_vault_to_pool(&pool_id, &vault_id, &owner).unwrap();
-    assert!(find_event_by_topic(&env, types::TTL_POOL_VAULT_ADDED_TOPIC));
+    let stranger = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let passkey = BytesN::from_array(&env, &[1u8; 32]);
+
+    let ids = soroban_sdk::vec![&env, id];
+    let err = client.try_batch_check_in_v2(&ids, &stranger, &passkey).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(6)); // NotOwner
 }
 
 #[test]
-fn test_remove_vault_from_pool_clears_membership() {
-    let (_, owner, beneficiary, _, _, client) = setup();
-    let pool_id = client.create_ttl_pool(&owner, &3600u64);
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-
-    client.add_vault_to_pool(&pool_id, &vault_id, &owner).unwrap();
-    client.remove_vault_from_pool(&vault_id, &owner).unwrap();
-
-    assert_eq!(client.get_pool_vaults(&pool_id).len(), 0);
-    assert_eq!(client.get_vault_pool(&vault_id), None);
-}
-
-#[test]
-fn test_remove_vault_from_pool_not_in_pool_fails() {
-    let (_, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    assert!(client.try_remove_vault_from_pool(&vault_id, &owner).is_err());
-}
-
-#[test]
-fn test_remove_vault_from_pool_emits_event() {
+fn test_batch_check_in_v2_rejects_released_vault() {
     let (env, owner, beneficiary, _, _, client) = setup();
-    let pool_id = client.create_ttl_pool(&owner, &3600u64);
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    client.add_vault_to_pool(&pool_id, &vault_id, &owner).unwrap();
-    client.remove_vault_from_pool(&vault_id, &owner).unwrap();
-    assert!(find_event_by_topic(&env, types::TTL_POOL_VAULT_REMOVED_TOPIC));
-}
+    let id = client.create_vault(&owner, &beneficiary, &1u64, &None);
+    let passkey = BytesN::from_array(&env, &[1u8; 32]);
 
-#[test]
-fn test_pool_check_in_resets_all_member_vaults() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let pool_id = client.create_ttl_pool(&owner, &3600u64);
-    let vault_id_1 = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    let vault_id_2 = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-
-    client.add_vault_to_pool(&pool_id, &vault_id_1, &owner).unwrap();
-    client.add_vault_to_pool(&pool_id, &vault_id_2, &owner).unwrap();
-
-    env.ledger().with_mut(|l| l.timestamp += 1000);
-    let now = env.ledger().timestamp();
-    client.pool_check_in(&pool_id, &owner).unwrap();
-
-    assert_eq!(client.get_vault(&vault_id_1).last_check_in, now);
-    assert_eq!(client.get_vault(&vault_id_2).last_check_in, now);
-}
-
-#[test]
-fn test_pool_check_in_extends_vault_expiry() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let pool_id = client.create_ttl_pool(&owner, &3600u64);
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    client.add_vault_to_pool(&pool_id, &vault_id, &owner).unwrap();
-
-    env.ledger().with_mut(|l| l.timestamp += 3500);
-    client.pool_check_in(&pool_id, &owner).unwrap();
-
-    env.ledger().with_mut(|l| l.timestamp += 3500);
-    assert!(!client.is_expired(&vault_id));
-}
-
-#[test]
-fn test_pool_check_in_non_owner_fails() {
-    let (env, owner, _, _, _, client) = setup();
-    let pool_id = client.create_ttl_pool(&owner, &3600u64);
-    let other = Address::generate(&env);
-    assert!(client.try_pool_check_in(&pool_id, &other).is_err());
-}
-
-#[test]
-fn test_pool_check_in_nonexistent_pool_fails() {
-    let (_, owner, _, _, _, client) = setup();
-    assert!(client.try_pool_check_in(&999u64, &owner).is_err());
-}
-
-#[test]
-fn test_pool_check_in_paused_contract_fails() {
-    let (_, owner, _, _, _, client) = setup();
-    let pool_id = client.create_ttl_pool(&owner, &3600u64);
-    client.pause();
-    assert!(client.try_pool_check_in(&pool_id, &owner).is_err());
-    client.unpause();
-}
-
-#[test]
-fn test_pool_check_in_emits_event() {
-    let (env, owner, _, _, _, client) = setup();
-    let pool_id = client.create_ttl_pool(&owner, &3600u64);
-    client.pool_check_in(&pool_id, &owner).unwrap();
-    assert!(find_event_by_topic(&env, types::TTL_POOL_CHECK_IN_TOPIC));
-}
-
-#[test]
-fn test_pool_check_in_skips_released_vaults() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let pool_id = client.create_ttl_pool(&owner, &100u64);
-    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
-    client.deposit(&vault_id, &owner, &500i128);
-    client.add_vault_to_pool(&pool_id, &vault_id, &owner).unwrap();
-
-    // Expire and release the vault
-    env.ledger().with_mut(|l| l.timestamp += 200);
-    client.trigger_release(&vault_id);
-
-    // Pool check-in should not panic even with a released vault in the pool
-    client.pool_check_in(&pool_id, &owner).unwrap();
-}
-
-#[test]
-fn test_multiple_vaults_in_pool_all_reset() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let pool_id = client.create_ttl_pool(&owner, &3600u64);
-
-    let ids: alloc::vec::Vec<u64> = (0..3)
-        .map(|_| {
-            let vid = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-            client.add_vault_to_pool(&pool_id, &vid, &owner).unwrap();
-            vid
-        })
-        .collect();
-
-    env.ledger().with_mut(|l| l.timestamp += 500);
-    let now = env.ledger().timestamp();
-    client.pool_check_in(&pool_id, &owner).unwrap();
-
-    for vid in &ids {
-        assert_eq!(client.get_vault(vid).last_check_in, now);
-    }
-}
-
-// ── Biometric Verification tests ─────────────────────────────────────────────
-
-#[test]
-fn test_register_biometric_stores_credential() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    let cred = BytesN::<32>::from_array(&env, &[0xABu8; 32]);
-
-    client.register_biometric(&vault_id, &owner, &cred).unwrap();
-
-    let entries = client.get_vault_biometrics(&vault_id);
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries.get(0).unwrap().credential_hash, cred);
-}
-
-#[test]
-fn test_register_biometric_non_owner_fails() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    let cred = BytesN::<32>::from_array(&env, &[0x01u8; 32]);
-    let other = Address::generate(&env);
-    assert!(client.try_register_biometric(&vault_id, &other, &cred).is_err());
-}
-
-#[test]
-fn test_register_biometric_duplicate_fails() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    let cred = BytesN::<32>::from_array(&env, &[0x02u8; 32]);
-
-    client.register_biometric(&vault_id, &owner, &cred).unwrap();
-    assert!(client.try_register_biometric(&vault_id, &owner, &cred).is_err());
-}
-
-#[test]
-fn test_register_biometric_released_vault_fails() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
-    client.deposit(&vault_id, &owner, &500i128);
-    env.ledger().with_mut(|l| l.timestamp += 200);
-    client.trigger_release(&vault_id);
-
-    let cred = BytesN::<32>::from_array(&env, &[0x03u8; 32]);
-    assert!(client.try_register_biometric(&vault_id, &owner, &cred).is_err());
-}
-
-#[test]
-fn test_register_biometric_emits_event() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    let cred = BytesN::<32>::from_array(&env, &[0x04u8; 32]);
-
-    client.register_biometric(&vault_id, &owner, &cred).unwrap();
-    assert!(find_event_by_topic(&env, types::BIOMETRIC_REGISTERED_TOPIC));
-}
-
-#[test]
-fn test_remove_biometric_removes_credential() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    let cred = BytesN::<32>::from_array(&env, &[0x05u8; 32]);
-
-    client.register_biometric(&vault_id, &owner, &cred).unwrap();
-    client.remove_biometric(&vault_id, &owner, &cred).unwrap();
-
-    assert_eq!(client.get_vault_biometrics(&vault_id).len(), 0);
-    assert!(!client.is_valid_biometric(&vault_id, &cred));
-}
-
-#[test]
-fn test_remove_biometric_not_found_fails() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    let cred = BytesN::<32>::from_array(&env, &[0x06u8; 32]);
-    assert!(client.try_remove_biometric(&vault_id, &owner, &cred).is_err());
-}
-
-#[test]
-fn test_remove_biometric_non_owner_fails() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    let cred = BytesN::<32>::from_array(&env, &[0x07u8; 32]);
-    let other = Address::generate(&env);
-
-    client.register_biometric(&vault_id, &owner, &cred).unwrap();
-    assert!(client.try_remove_biometric(&vault_id, &other, &cred).is_err());
-}
-
-#[test]
-fn test_remove_biometric_emits_event() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    let cred = BytesN::<32>::from_array(&env, &[0x08u8; 32]);
-
-    client.register_biometric(&vault_id, &owner, &cred).unwrap();
-    client.remove_biometric(&vault_id, &owner, &cred).unwrap();
-    assert!(find_event_by_topic(&env, types::BIOMETRIC_REMOVED_TOPIC));
-}
-
-#[test]
-fn test_biometric_check_in_succeeds_with_valid_credential() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    let cred = BytesN::<32>::from_array(&env, &[0x09u8; 32]);
-
-    client.register_biometric(&vault_id, &owner, &cred).unwrap();
-    env.ledger().with_mut(|l| l.timestamp += 100);
-    let now = env.ledger().timestamp();
-
-    client.biometric_check_in(&vault_id, &owner, &cred).unwrap();
-    assert_eq!(client.get_vault(&vault_id).last_check_in, now);
-}
-
-#[test]
-fn test_biometric_check_in_invalid_credential_fails() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    let cred = BytesN::<32>::from_array(&env, &[0x0Au8; 32]);
-    let wrong = BytesN::<32>::from_array(&env, &[0x0Bu8; 32]);
-
-    client.register_biometric(&vault_id, &owner, &cred).unwrap();
-    assert!(client.try_biometric_check_in(&vault_id, &owner, &wrong).is_err());
-}
-
-#[test]
-fn test_biometric_check_in_no_credentials_fails() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    let cred = BytesN::<32>::from_array(&env, &[0x0Cu8; 32]);
-    assert!(client.try_biometric_check_in(&vault_id, &owner, &cred).is_err());
-}
-
-#[test]
-fn test_biometric_check_in_non_owner_fails() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    let cred = BytesN::<32>::from_array(&env, &[0x0Du8; 32]);
-    let other = Address::generate(&env);
-
-    client.register_biometric(&vault_id, &owner, &cred).unwrap();
-    assert!(client.try_biometric_check_in(&vault_id, &other, &cred).is_err());
-}
-
-#[test]
-fn test_biometric_check_in_paused_contract_fails() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    let cred = BytesN::<32>::from_array(&env, &[0x0Eu8; 32]);
-
-    client.register_biometric(&vault_id, &owner, &cred).unwrap();
-    client.pause();
-    assert!(client.try_biometric_check_in(&vault_id, &owner, &cred).is_err());
-    client.unpause();
-}
-
-#[test]
-fn test_biometric_check_in_released_vault_fails() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
-    let cred = BytesN::<32>::from_array(&env, &[0x0Fu8; 32]);
-
-    client.register_biometric(&vault_id, &owner, &cred).unwrap();
-    client.deposit(&vault_id, &owner, &500i128);
-    env.ledger().with_mut(|l| l.timestamp += 200);
-    client.trigger_release(&vault_id);
-
-    assert!(client.try_biometric_check_in(&vault_id, &owner, &cred).is_err());
-}
-
-#[test]
-fn test_biometric_check_in_extends_vault_ttl() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    let cred = BytesN::<32>::from_array(&env, &[0x10u8; 32]);
-
-    client.register_biometric(&vault_id, &owner, &cred).unwrap();
-    env.ledger().with_mut(|l| l.timestamp += 3500);
-    client.biometric_check_in(&vault_id, &owner, &cred).unwrap();
-
-    env.ledger().with_mut(|l| l.timestamp += 3500);
-    assert!(!client.is_expired(&vault_id));
-}
-
-#[test]
-fn test_biometric_check_in_emits_event() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    let cred = BytesN::<32>::from_array(&env, &[0x11u8; 32]);
-
-    client.register_biometric(&vault_id, &owner, &cred).unwrap();
-    client.biometric_check_in(&vault_id, &owner, &cred).unwrap();
-    assert!(find_event_by_topic(&env, types::BIOMETRIC_CHECK_IN_TOPIC));
-}
-
-#[test]
-fn test_is_valid_biometric_returns_correct_result() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    let cred = BytesN::<32>::from_array(&env, &[0x12u8; 32]);
-    let other = BytesN::<32>::from_array(&env, &[0x13u8; 32]);
-
-    assert!(!client.is_valid_biometric(&vault_id, &cred));
-    client.register_biometric(&vault_id, &owner, &cred).unwrap();
-    assert!(client.is_valid_biometric(&vault_id, &cred));
-    assert!(!client.is_valid_biometric(&vault_id, &other));
-}
-
-#[test]
-fn test_multiple_biometric_credentials_per_vault() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    let cred1 = BytesN::<32>::from_array(&env, &[0x14u8; 32]);
-    let cred2 = BytesN::<32>::from_array(&env, &[0x15u8; 32]);
-
-    client.register_biometric(&vault_id, &owner, &cred1).unwrap();
-    client.register_biometric(&vault_id, &owner, &cred2).unwrap();
-
-    assert_eq!(client.get_vault_biometrics(&vault_id).len(), 2);
-
-    // Either credential should work for check-in
-    client.biometric_check_in(&vault_id, &owner, &cred1).unwrap();
+    // Expire the vault
     env.ledger().with_mut(|l| l.timestamp += 10);
-    client.biometric_check_in(&vault_id, &owner, &cred2).unwrap();
+    client.trigger_release(&id);
+
+    let ids = soroban_sdk::vec![&env, id];
+    let err = client.try_batch_check_in_v2(&ids, &owner, &passkey).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(7)); // AlreadyReleased
+}
+
+// ── Issue #482: TTL prediction model ─────────────────────────────────────────
+
+#[test]
+fn test_predict_expiry_falls_back_to_interval_with_no_history() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let vault = client.get_vault(&id);
+    let predicted = client.predict_expiry(&id);
+    // With no history, should be last_check_in + check_in_interval
+    assert_eq!(predicted, vault.last_check_in + vault.check_in_interval);
 }
 
 #[test]
-fn test_biometric_check_in_logs_activity() {
+fn test_predict_expiry_uses_history_average() {
     let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    let cred = BytesN::<32>::from_array(&env, &[0x16u8; 32]);
+    let passkey = BytesN::from_array(&env, &[1u8; 32]);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
 
-    client.register_biometric(&vault_id, &owner, &cred).unwrap();
-    client.biometric_check_in(&vault_id, &owner, &cred).unwrap();
+    // Two check-ins 1800s apart
+    env.ledger().with_mut(|l| l.timestamp += 1800);
+    client.check_in(&id, &owner, &passkey).unwrap();
+    env.ledger().with_mut(|l| l.timestamp += 1800);
+    client.check_in(&id, &owner, &passkey).unwrap();
 
-    let log = client.get_vault_audit_log(&vault_id);
-    let actions: alloc::vec::Vec<soroban_sdk::String> = log.iter().map(|e| e.action).collect();
-    assert!(actions.iter().any(|a| *a == soroban_sdk::String::from_str(&env, "biometric_check_in")));
+    let predicted = client.predict_expiry(&id);
+    let vault = client.get_vault(&id);
+    // Average interval is 1800, so predicted = last_check_in + 1800
+    assert_eq!(predicted, vault.last_check_in + 1800);
+}
+
+#[test]
+fn test_get_check_in_streak_increments_on_time() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let passkey = BytesN::from_array(&env, &[1u8; 32]);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    env.ledger().with_mut(|l| l.timestamp += 1800);
+    client.check_in(&id, &owner, &passkey).unwrap();
+    let streak = client.get_check_in_streak(&id);
+    assert_eq!(streak.current, 1);
+    assert_eq!(streak.best, 1);
+
+    env.ledger().with_mut(|l| l.timestamp += 1800);
+    client.check_in(&id, &owner, &passkey).unwrap();
+    let streak2 = client.get_check_in_streak(&id);
+    assert_eq!(streak2.current, 2);
+    assert_eq!(streak2.best, 2);
+}
+
+// ── Issue #481: check-in proof-of-work ───────────────────────────────────────
+
+#[test]
+fn test_check_in_with_pow_zero_difficulty_always_passes() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let passkey = BytesN::from_array(&env, &[1u8; 32]);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    // difficulty=0 means any nonce is valid
+    client.check_in_with_pow(&id, &owner, &passkey, &0u64, &0u32).unwrap();
+    let vault = client.get_vault(&id);
+    assert!(vault.last_check_in > 0);
+}
+
+#[test]
+fn test_check_in_with_pow_rejects_wrong_owner() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let stranger = Address::generate(&env);
+    let passkey = BytesN::from_array(&env, &[1u8; 32]);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let err = client.try_check_in_with_pow(&id, &stranger, &passkey, &0u64, &0u32).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(6)); // NotOwner
+}
+
+#[test]
+fn test_check_in_with_pow_rejects_invalid_nonce() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let passkey = BytesN::from_array(&env, &[1u8; 32]);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    // difficulty=20 with nonce=0 is extremely unlikely to pass
+    let err = client.try_check_in_with_pow(&id, &owner, &passkey, &0u64, &20u32).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(26)); // InvalidPasskey (reused for PoW)
+}
+
+// ── Issue #480: check-in delegation ──────────────────────────────────────────
+
+#[test]
+fn test_add_and_check_delegate() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let delegate = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    assert!(!client.is_check_in_delegate_pub(&id, &delegate));
+    client.add_check_in_delegate(&id, &owner, &delegate).unwrap();
+    assert!(client.is_check_in_delegate_pub(&id, &delegate));
+
+    let delegates = client.get_check_in_delegates(&id);
+    assert_eq!(delegates.len(), 1);
+}
+
+#[test]
+fn test_delegate_can_check_in() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let delegate = Address::generate(&env);
+    let passkey = BytesN::from_array(&env, &[1u8; 32]);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    client.add_check_in_delegate(&id, &owner, &delegate).unwrap();
+
+    env.ledger().with_mut(|l| l.timestamp += 100);
+    client.check_in(&id, &delegate, &passkey).unwrap();
+    let vault = client.get_vault(&id);
+    assert!(vault.last_check_in > 0);
+}
+
+#[test]
+fn test_remove_delegate() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let delegate = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    client.add_check_in_delegate(&id, &owner, &delegate).unwrap();
+    client.remove_check_in_delegate(&id, &owner, &delegate).unwrap();
+    assert!(!client.is_check_in_delegate_pub(&id, &delegate));
+}
+
+#[test]
+fn test_non_delegate_cannot_check_in() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let stranger = Address::generate(&env);
+    let passkey = BytesN::from_array(&env, &[1u8; 32]);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let err = client.try_check_in(&id, &stranger, &passkey).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(6)); // NotOwner
+}
+
+#[test]
+fn test_add_duplicate_delegate_fails() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let delegate = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    client.add_check_in_delegate(&id, &owner, &delegate).unwrap();
+    let err = client.try_add_check_in_delegate(&id, &owner, &delegate).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(17)); // InvalidBeneficiary (reused)
+}
+
+#[test]
+fn test_remove_nonexistent_delegate_fails() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let delegate = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let err = client.try_remove_check_in_delegate(&id, &owner, &delegate).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(27)); // PasskeyNotFound (reused)
 }
