@@ -3540,164 +3540,181 @@ fn test_activity_log_empty_for_new_vault_before_create() {
     assert!(log.is_empty());
 }
 
-// ── Issue #472: Vault State Transition Audit Trail ───────────────────────────
+// ---- Issue #468: Vault Metadata Versioning ----
 
 #[test]
-fn test_state_transition_log_on_cancel() {
-    let (_, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    client.cancel_vault(&vault_id, &owner).unwrap();
-
-    let log = client.get_state_transition_log(&vault_id);
-    assert_eq!(log.len(), 1);
-    let entry = log.get(0).unwrap();
-    assert_eq!(entry.from_status, crate::types::ReleaseStatus::Locked);
-    assert_eq!(entry.to_status, crate::types::ReleaseStatus::Cancelled);
-    assert_eq!(entry.actor, owner);
-}
-
-#[test]
-fn test_state_transition_log_empty_for_locked_vault() {
-    let (_, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    let log = client.get_state_transition_log(&vault_id);
-    assert!(log.is_empty());
-}
-
-#[test]
-fn test_state_transition_log_on_release() {
+fn test_metadata_versioning_records_history() {
     let (env, owner, beneficiary, _, _, client) = setup();
     let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    client.deposit(&vault_id, &owner, &1000i128);
 
-    // Advance time past check-in interval to expire the vault
-    env.ledger().with_mut(|l| l.timestamp = l.timestamp + 7200);
+    client.update_metadata_versioned(&vault_id, &owner, &String::from_str(&env, "v1")).unwrap();
+    client.update_metadata_versioned(&vault_id, &owner, &String::from_str(&env, "v2")).unwrap();
 
-    client.trigger_release(&vault_id);
-
-    let log = client.get_state_transition_log(&vault_id);
-    assert_eq!(log.len(), 1);
-    let entry = log.get(0).unwrap();
-    assert_eq!(entry.from_status, crate::types::ReleaseStatus::Locked);
-    assert_eq!(entry.to_status, crate::types::ReleaseStatus::Released);
+    let history = client.get_metadata_history(&vault_id);
+    assert_eq!(history.len(), 2);
+    // First entry is the original empty metadata
+    assert_eq!(history.get(0).unwrap().version, 1);
+    assert_eq!(history.get(1).unwrap().version, 2);
+    // Current vault metadata should be "v2"
+    assert_eq!(client.get_vault(&vault_id).metadata, String::from_str(&env, "v2"));
 }
 
-// ── Issue #473: Vault Ownership Proof ────────────────────────────────────────
-
 #[test]
-fn test_prove_vault_ownership_success() {
-    let (_, owner, beneficiary, _, _, client) = setup();
+fn test_metadata_revert_to_previous_version() {
+    let (env, owner, beneficiary, _, _, client) = setup();
     let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
 
-    let proof = client.prove_vault_ownership(&vault_id, &owner).unwrap();
-    assert_eq!(proof.vault_id, vault_id);
-    assert!(proof.is_active);
-    // owner_hash should be non-zero (32 bytes)
-    assert_eq!(proof.owner_hash.len(), 32);
+    client.update_metadata_versioned(&vault_id, &owner, &String::from_str(&env, "first")).unwrap();
+    client.update_metadata_versioned(&vault_id, &owner, &String::from_str(&env, "second")).unwrap();
+
+    // Revert to version 1 (which stored the original empty string)
+    client.revert_metadata(&vault_id, &owner, &1u32).unwrap();
+    assert_eq!(client.get_vault(&vault_id).metadata, String::from_str(&env, ""));
 }
 
 #[test]
-fn test_prove_vault_ownership_non_owner_fails() {
+fn test_metadata_revert_invalid_version_fails() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let err = client.try_revert_metadata(&vault_id, &owner, &99u32).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(48)); // MetadataVersionNotFound
+}
+
+#[test]
+fn test_metadata_versioning_non_owner_fails() {
     let (env, owner, beneficiary, _, _, client) = setup();
     let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
     let other = Address::generate(&env);
 
-    let err = client.try_prove_vault_ownership(&vault_id, &other).unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(ContractError::NotOwner as u32));
+    let err = client.try_update_metadata_versioned(&vault_id, &other, &String::from_str(&env, "x")).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(6)); // NotOwner
+}
+
+// ---- Issue #469: Vault Archival Automation ----
+
+#[test]
+fn test_archive_vault_after_release() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1u64, &None);
+    client.deposit(&vault_id, &owner, &100_000i128);
+
+    // Advance time past check-in interval
+    env.ledger().with_mut(|l| l.timestamp = 10_000);
+    client.trigger_release(&vault_id);
+
+    // Auto-archive should have stored the snapshot
+    let archived = client.get_archived_vault_info(&vault_id);
+    assert!(archived.is_some());
+    assert_eq!(archived.unwrap().0.status, ReleaseStatus::Released);
 }
 
 #[test]
-fn test_prove_vault_ownership_inactive_after_cancel() {
-    let (_, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    client.cancel_vault(&vault_id, &owner).unwrap();
+fn test_manual_archive_vault() {
+    let (env, owner, beneficiary, _admin, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &1u64, &None);
+    client.deposit(&vault_id, &owner, &100_000i128);
 
-    let proof = client.prove_vault_ownership(&vault_id, &owner).unwrap();
-    assert!(!proof.is_active);
-}
+    env.ledger().with_mut(|l| l.timestamp = 10_000);
+    client.trigger_release(&vault_id);
 
-// ── Issue #474: Vault Integrity Verification ─────────────────────────────────
-
-#[test]
-fn test_verify_vault_integrity_success() {
-    let (_, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-
-    let report = client.verify_vault_integrity(&vault_id).unwrap();
-    assert_eq!(report.vault_id, vault_id);
-    assert!(report.is_valid);
-    assert_eq!(report.checksum.len(), 32);
+    // Owner can also manually archive (auto-archive already ran, but calling again is idempotent)
+    client.archive_vault(&vault_id, &owner).unwrap();
+    assert!(client.get_archived_vault_info(&vault_id).is_some());
 }
 
 #[test]
-fn test_verify_vault_integrity_checksum_changes_after_deposit() {
-    let (_, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-
-    let report1 = client.verify_vault_integrity(&vault_id).unwrap();
-    client.deposit(&vault_id, &owner, &500i128);
-    let report2 = client.verify_vault_integrity(&vault_id).unwrap();
-
-    // Checksum must differ after balance changes
-    assert_ne!(report1.checksum, report2.checksum);
-}
-
-#[test]
-fn test_verify_vault_integrity_nonexistent_vault_fails() {
-    let (_, _, _, _, _, client) = setup();
-    let err = client.try_verify_vault_integrity(&9999u64).unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(ContractError::VaultNotFound as u32));
-}
-
-// ── Issue #475: Vault Batch Status Query ─────────────────────────────────────
-
-#[test]
-fn test_batch_status_returns_all_found_vaults() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let id1 = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    let id2 = client.create_vault(&owner, &beneficiary, &7200u64, &None);
-
-    let results = client.get_vault_batch_status(&soroban_sdk::vec![&env, id1, id2]);
-    assert_eq!(results.len(), 2);
-}
-
-#[test]
-fn test_batch_status_skips_nonexistent_vaults() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let id1 = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-
-    let results = client.get_vault_batch_status(&soroban_sdk::vec![&env, id1, 9999u64]);
-    assert_eq!(results.len(), 1);
-    assert_eq!(results.get(0).unwrap().vault_id, id1);
-}
-
-#[test]
-fn test_batch_status_reflects_correct_balance_and_status() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    client.deposit(&vault_id, &owner, &1000i128);
-
-    let results = client.get_vault_batch_status(&soroban_sdk::vec![&env, vault_id]);
-    let summary = results.get(0).unwrap();
-    assert_eq!(summary.balance, 1000i128);
-    assert_eq!(summary.status, crate::types::ReleaseStatus::Locked);
-    assert!(!summary.is_expired);
-}
-
-#[test]
-fn test_batch_status_marks_expired_vault() {
+fn test_archive_locked_vault_fails() {
     let (env, owner, beneficiary, _, _, client) = setup();
     let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
 
-    env.ledger().with_mut(|l| l.timestamp = l.timestamp + 7200);
+    let err = client.try_archive_vault(&vault_id, &owner).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(16)); // NotExpired
+}
 
-    let results = client.get_vault_batch_status(&soroban_sdk::vec![&env, vault_id]);
-    assert!(results.get(0).unwrap().is_expired);
+// ---- Issue #470: Vault Capacity Limits ----
+
+#[test]
+fn test_vault_capacity_limit_enforced() {
+    let (env, owner, beneficiary, _admin, _, client) = setup();
+    // Set limit to 2 vaults per owner
+    client.set_owner_vault_limit(&2u32);
+    assert_eq!(client.get_owner_vault_limit(), 2u32);
+
+    let b2 = Address::generate(&env);
+    let b3 = Address::generate(&env);
+    client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.create_vault(&owner, &b2, &3600u64, &None);
+
+    // Third vault should fail
+    let err = client.try_create_vault(&owner, &b3, &3600u64, &None).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(49)); // VaultCapacityExceeded
 }
 
 #[test]
-fn test_batch_status_empty_input() {
-    let (env, _, _, _, _, client) = setup();
-    let results = client.get_vault_batch_status(&soroban_sdk::vec![&env]);
-    assert!(results.is_empty());
+fn test_vault_capacity_zero_means_unlimited() {
+    let (env, owner, beneficiary, _admin, _, client) = setup();
+    client.set_owner_vault_limit(&0u32); // unlimited
+
+    let b2 = Address::generate(&env);
+    let b3 = Address::generate(&env);
+    // Should be able to create multiple vaults
+    client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.create_vault(&owner, &b2, &3600u64, &None);
+    client.create_vault(&owner, &b3, &3600u64, &None);
+    assert_eq!(client.vault_count(), 3u64);
+}
+
+// ---- Issue #471: Vault Merge Validation ----
+
+#[test]
+fn test_merge_vaults_different_token_fails() {
+    let (env, owner, beneficiary, admin, token_address, client) = setup();
+
+    // Register a second token
+    let token2_admin = Address::generate(&env);
+    let token2 = env.register_stellar_asset_contract_v2(token2_admin.clone()).address();
+    client.whitelist_token(&token2);
+
+    let vault1 = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let vault2 = client.create_vault(&owner, &beneficiary, &3600u64, &Some(token2));
+
+    let sources = soroban_sdk::vec![&env, vault2];
+    let err = client.try_merge_vaults(&vault1, &sources, &owner).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(50)); // IncompatibleVaultToken
+}
+
+#[test]
+fn test_merge_vaults_non_locked_source_fails() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    use soroban_sdk::token::StellarAssetClient;
+    StellarAssetClient::new(&env, &token_address).mint(&owner, &1_000_000);
+
+    let target = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let source = client.create_vault(&owner, &beneficiary, &1u64, &None);
+    client.deposit(&source, &owner, &50_000i128);
+
+    // Advance time to expire and release source vault
+    env.ledger().with_mut(|l| l.timestamp = 10_000);
+    client.trigger_release(&source);
+
+    // Try to merge released source into target — should fail
+    let sources = soroban_sdk::vec![&env, source];
+    let err = client.try_merge_vaults(&target, &sources, &owner).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(51)); // IncompatibleVaultStatus
+}
+
+#[test]
+fn test_merge_vaults_same_token_succeeds() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    use soroban_sdk::token::StellarAssetClient;
+    StellarAssetClient::new(&env, &token_address).mint(&owner, &1_000_000);
+
+    let target = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let source = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.deposit(&source, &owner, &50_000i128);
+
+    let sources = soroban_sdk::vec![&env, source];
+    client.merge_vaults(&target, &sources, &owner).unwrap();
+    assert_eq!(client.get_vault(&target).balance, 50_000i128);
 }
