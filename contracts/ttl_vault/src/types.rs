@@ -47,11 +47,15 @@ pub const SYNC_TTL_TOPIC: Symbol = symbol_short!("sync_ttl");
 pub const PASSKEY_EXPIRY_EXTENDED_TOPIC: Symbol = symbol_short!("pk_exp");
 pub const BENEFICIARY_ACCEPTED_TOPIC: Symbol = symbol_short!("ben_acc");
 pub const BENEFICIARY_DECLINED_TOPIC: Symbol = symbol_short!("ben_dec");
+pub const BENEFICIARY_CONDITION_ACCEPTED_TOPIC: Symbol = symbol_short!("ben_cond");
+pub const BENEFICIARY_CONFLICT_FILED_TOPIC: Symbol = symbol_short!("ben_conf");
+pub const BENEFICIARY_CONFLICT_RESOLVED_TOPIC: Symbol = symbol_short!("ben_res");
 pub const SET_RECOVERY_TOPIC: Symbol = symbol_short!("set_rec");
 pub const RECOVERY_EXTEND_TOPIC: Symbol = symbol_short!("rec_ext");
 pub const RESTORE_VAULT_TOPIC: Symbol = symbol_short!("restore");
 pub const PASSKEY_USAGE_TOPIC: Symbol = symbol_short!("pk_usage");
 pub const VAULT_CLONED_TOPIC: Symbol = symbol_short!("v_clone");
+pub const VAULT_CLONED_OVERRIDE_TOPIC: Symbol = symbol_short!("v_clo_ov");
 pub const VAULT_MERGED_TOPIC: Symbol = symbol_short!("v_merge");
 pub const MULTISIG_CONFIG_TOPIC: Symbol = symbol_short!("ms_cfg");
 pub const MULTISIG_PROPOSED_TOPIC: Symbol = symbol_short!("ms_prop");
@@ -94,13 +98,33 @@ pub const DUPLICATE_VAULT_TOPIC: Symbol = symbol_short!("dup_vault");
 pub const MIN_THRESHOLD_SET_TOPIC: Symbol = symbol_short!("min_thr");
 pub const MIN_THRESHOLD_SKIP_TOPIC: Symbol = symbol_short!("min_skip");
 pub const MIN_THRESHOLD_REDISTRIBUTE_TOPIC: Symbol = symbol_short!("min_rdst");
+// Issue #547: vesting penalty applied
+pub const VESTING_PENALTY_TOPIC: Symbol = symbol_short!("vest_pen");
+// Issue #548: vesting claim reversed / finalized
+pub const VESTING_REVERSED_TOPIC: Symbol = symbol_short!("vest_rev");
+pub const VESTING_FINALIZED_TOPIC: Symbol = symbol_short!("vest_fin");
+// Issue #549: passkey expired during check-in
+pub const PASSKEY_EXPIRED_TOPIC: Symbol = symbol_short!("pk_expd");
+// Issue #550: passkey compromise detected or reported
+pub const PASSKEY_COMPROMISED_TOPIC: Symbol = symbol_short!("pk_comp");
 
 // Issue: TTL Borrowing
 pub const TTL_BORROW_TOPIC: Symbol = symbol_short!("ttl_bor");
 pub const TTL_REPAY_TOPIC: Symbol = symbol_short!("ttl_rep");
 
+// Vault state snapshots
+pub const SNAPSHOT_CREATED_TOPIC: Symbol = symbol_short!("snap_crt");
+pub const SNAPSHOT_RESTORED_TOPIC: Symbol = symbol_short!("snap_rst");
+
+// Configurable countdown notifications
+pub const COUNTDOWN_NOTIF_TOPIC: Symbol = symbol_short!("cd_notif");
+pub const SET_COUNTDOWN_TOPIC: Symbol = symbol_short!("set_cd");
+
 // Issue: Check-in Rate Limiting
 pub const CHECKIN_RATE_LIMITED_TOPIC: Symbol = symbol_short!("ci_rl");
+
+// Beneficiary capacity limit
+pub const BENEFICIARY_CAP_TOPIC: Symbol = symbol_short!("ben_cap");
 
 // Issue: Accelerated TTL Decay
 pub const TTL_ACCELERATE_TOPIC: Symbol = symbol_short!("ttl_acc");
@@ -227,6 +251,8 @@ pub enum DataKey {
     BeneficiaryRotationSchedule(u64),
     CheckInGeoLog(u64),
     TtlBorrow(u64),
+    // Issue #553: encrypted backup codes
+    EncryptedBackupCodes(u64),
 }
 
 /// Check-in history entry for TTL prediction - Issue #482
@@ -464,13 +490,50 @@ pub struct WithdrawalScheduleEntry {
     pub amount: i128,
 }
 
-/// Conditional acceptance entry - Issue #400
+/// Conditional acceptance entry - Issue #400, #503
 #[contracttype]
 #[derive(Clone)]
 pub struct ConditionalAcceptanceEntry {
     pub conditions: String,
     pub approved_by_owner: bool,
     pub acceptance_deadline: Option<u64>,
+    pub min_balance_threshold: Option<i128>,
+}
+
+/// Beneficiary conditional acceptance with threshold - Issue #503
+#[contracttype]
+#[derive(Clone)]
+pub struct BeneficiaryConditionalAcceptance {
+    pub min_balance_threshold: i128,
+    pub accepted_at: u64,
+}
+
+/// Beneficiary conflict claim - Issue #502
+#[contracttype]
+#[derive(Clone)]
+pub struct BeneficiaryConflictClaim {
+    pub claimant: Address,
+    pub reason: String,
+    pub filed_at: u64,
+}
+
+/// Beneficiary conflict resolution - Issue #502
+#[contracttype]
+#[derive(Clone)]
+pub enum ConflictResolution {
+    Pending,
+    Approved(Address),
+    Rejected,
+}
+
+/// Beneficiary conflict entry - Issue #502
+#[contracttype]
+#[derive(Clone)]
+pub struct BeneficiaryConflict {
+    pub vault_id: u64,
+    pub claims: Vec<BeneficiaryConflictClaim>,
+    pub resolution: ConflictResolution,
+    pub resolved_at: Option<u64>,
 }
 
 /// Activity log entry for forensic audit trail
@@ -689,4 +752,13 @@ pub struct ReleaseVoteEntry {
 pub struct BeneficiaryRotationEntry {
     pub effective_timestamp: u64,
     pub new_beneficiaries: Vec<BeneficiaryEntry>,
+/// Configurable countdown notification thresholds for a vault.
+/// Each threshold (in seconds before expiry) triggers a `cd_notif` event
+/// when `check_countdown` is called and the TTL crosses that boundary.
+/// Default thresholds: 7 days (604800), 3 days (259200), 1 day (86400).
+#[contracttype]
+#[derive(Clone)]
+pub struct CountdownConfig {
+    /// Sorted descending list of thresholds in seconds (e.g. [604800, 259200, 86400]).
+    pub thresholds: Vec<u64>,
 }
