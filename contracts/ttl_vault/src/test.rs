@@ -3488,6 +3488,178 @@ fn test_set_acceptance_deadline_released_vault_fails() {
     assert!(result.is_err());
 }
 
+// ---- Issue #503: Beneficiary Conditional Acceptance with Threshold ----
+
+#[test]
+fn test_accept_with_threshold_beneficiary_only() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    // Only beneficiary can accept with threshold
+    let result = client.try_accept_with_threshold(&vault_id, &100_000i128);
+    assert!(result.is_ok());
+
+    let acceptance = client.get_beneficiary_conditional_acceptance(&vault_id);
+    assert!(acceptance.is_some());
+    assert_eq!(acceptance.unwrap().min_balance_threshold, 100_000i128);
+}
+
+#[test]
+fn test_accept_with_threshold_owner_fails() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    env.mock_all_auths_allowing_non_root_auth();
+    let result = client.try_accept_with_threshold(&vault_id, &100_000i128);
+    // Should fail because owner is not the beneficiary
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_accept_with_threshold_invalid_amount() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    // Zero threshold should fail
+    let result = client.try_accept_with_threshold(&vault_id, &0i128);
+    assert!(result.is_err());
+
+    // Negative threshold should fail
+    let result = client.try_accept_with_threshold(&vault_id, &-100i128);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_trigger_release_with_threshold_met() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    // Deposit 500_000
+    client.deposit(&vault_id, &owner, &500_000i128);
+
+    // Beneficiary accepts with threshold of 100_000
+    client.accept_with_threshold(&vault_id, &100_000i128);
+
+    // Advance time to expire vault
+    env.ledger().with_mut(|l| l.timestamp += 200);
+
+    // Should succeed because balance (500_000) >= threshold (100_000)
+    client.trigger_release(&vault_id);
+
+    let vault = client.get_vault(&vault_id);
+    assert_eq!(vault.status, ReleaseStatus::Released);
+    assert_eq!(vault.balance, 0);
+
+    let token_client = StellarAssetClient::new(&env, &token_address);
+    assert_eq!(token_client.balance(&beneficiary), 500_000i128);
+}
+
+#[test]
+fn test_trigger_release_with_threshold_not_met() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    // Deposit only 50_000
+    client.deposit(&vault_id, &owner, &50_000i128);
+
+    // Beneficiary accepts with threshold of 100_000
+    client.accept_with_threshold(&vault_id, &100_000i128);
+
+    // Advance time to expire vault
+    env.ledger().with_mut(|l| l.timestamp += 200);
+
+    // Should fail because balance (50_000) < threshold (100_000)
+    let result = client.try_trigger_release(&vault_id);
+    assert!(result.is_err());
+
+    let vault = client.get_vault(&vault_id);
+    assert_eq!(vault.status, ReleaseStatus::Locked);
+    assert_eq!(vault.balance, 50_000i128);
+}
+
+#[test]
+fn test_trigger_release_without_threshold_condition() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    // Deposit 50_000
+    client.deposit(&vault_id, &owner, &50_000i128);
+
+    // No conditional acceptance set - should release normally
+    env.ledger().with_mut(|l| l.timestamp += 200);
+    client.trigger_release(&vault_id);
+
+    let vault = client.get_vault(&vault_id);
+    assert_eq!(vault.status, ReleaseStatus::Released);
+
+    let token_client = StellarAssetClient::new(&env, &token_address);
+    assert_eq!(token_client.balance(&beneficiary), 50_000i128);
+}
+
+#[test]
+fn test_get_beneficiary_conditional_acceptance_not_set() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    let acceptance = client.get_beneficiary_conditional_acceptance(&vault_id);
+    assert!(acceptance.is_none());
+}
+
+#[test]
+fn test_accept_with_threshold_stores_timestamp() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    let before_timestamp = env.ledger().timestamp();
+    client.accept_with_threshold(&vault_id, &100_000i128);
+    let after_timestamp = env.ledger().timestamp();
+
+    let acceptance = client.get_beneficiary_conditional_acceptance(&vault_id);
+    assert!(acceptance.is_some());
+    let acc = acceptance.unwrap();
+    assert!(acc.accepted_at >= before_timestamp && acc.accepted_at <= after_timestamp);
+}
+
+#[test]
+fn test_accept_with_threshold_emits_event() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    client.accept_with_threshold(&vault_id, &100_000i128);
+
+    let events = env.events().all();
+    let event_found = events.iter().any(|e| {
+        e.topics.get(0).map_or(false, |t| {
+            t.to_val(&env).to_string().contains("ben_cond")
+        })
+    });
+    assert!(event_found, "BENEFICIARY_CONDITION_ACCEPTED_TOPIC event not found");
+}
+
+#[test]
+fn test_trigger_release_with_threshold_exact_match() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    // Deposit exactly 100_000
+    client.deposit(&vault_id, &owner, &100_000i128);
+
+    // Beneficiary accepts with threshold of 100_000
+    client.accept_with_threshold(&vault_id, &100_000i128);
+
+    // Advance time to expire vault
+    env.ledger().with_mut(|l| l.timestamp += 200);
+
+    // Should succeed because balance (100_000) == threshold (100_000)
+    client.trigger_release(&vault_id);
+
+    let vault = client.get_vault(&vault_id);
+    assert_eq!(vault.status, ReleaseStatus::Released);
+
+    let token_client = StellarAssetClient::new(&env, &token_address);
+    assert_eq!(token_client.balance(&beneficiary), 100_000i128);
+}
+
 // ---- Task 4: vault activity logging tests ----
 
 #[test]

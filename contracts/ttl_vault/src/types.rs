@@ -45,6 +45,7 @@ pub const SYNC_TTL_TOPIC: Symbol = symbol_short!("sync_ttl");
 pub const PASSKEY_EXPIRY_EXTENDED_TOPIC: Symbol = symbol_short!("pk_exp");
 pub const BENEFICIARY_ACCEPTED_TOPIC: Symbol = symbol_short!("ben_acc");
 pub const BENEFICIARY_DECLINED_TOPIC: Symbol = symbol_short!("ben_dec");
+pub const BENEFICIARY_CONDITION_ACCEPTED_TOPIC: Symbol = symbol_short!("ben_cond");
 pub const SET_RECOVERY_TOPIC: Symbol = symbol_short!("set_rec");
 pub const RECOVERY_EXTEND_TOPIC: Symbol = symbol_short!("rec_ext");
 pub const RESTORE_VAULT_TOPIC: Symbol = symbol_short!("restore");
@@ -180,6 +181,8 @@ pub enum DataKey {
     // Issue #499: beneficiary release votes
     ReleaseVotes(u64),
     ReleaseVoteThreshold(u64),
+    // Issue #503: beneficiary conditional acceptance with threshold
+    BeneficiaryConditionalAcceptance(u64),
 }
 
 /// Check-in history entry for TTL prediction - Issue #482
@@ -365,13 +368,22 @@ pub struct WithdrawalScheduleEntry {
     pub amount: i128,
 }
 
-/// Conditional acceptance entry - Issue #400
+/// Conditional acceptance entry - Issue #400, #503
 #[contracttype]
 #[derive(Clone)]
 pub struct ConditionalAcceptanceEntry {
     pub conditions: String,
     pub approved_by_owner: bool,
     pub acceptance_deadline: Option<u64>,
+    pub min_balance_threshold: Option<i128>,
+}
+
+/// Beneficiary conditional acceptance with threshold - Issue #503
+#[contracttype]
+#[derive(Clone)]
+pub struct BeneficiaryConditionalAcceptance {
+    pub min_balance_threshold: i128,
+    pub accepted_at: u64,
 }
 
 /// Activity log entry for forensic audit trail

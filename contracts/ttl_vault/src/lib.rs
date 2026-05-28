@@ -14,6 +14,7 @@ use types::{
     StateTransitionEntry, OwnershipProof, IntegrityReport, VaultStatusSummary,
     TtlBorrowRecord,
     GeoCheckInEntry,
+    BeneficiaryConditionalAcceptance,
     EXPIRY_WARNING_THRESHOLD, BENEFICIARY_UPDATED_TOPIC, CANCEL_TOPIC, CHECK_IN_TOPIC,
     CLAIM_VEST_TOPIC, DEPOSIT_TOPIC, OWNERSHIP_TOPIC, PAUSE_TOPIC, PING_EXPIRY_TOPIC,
     RELEASE_TOPIC, SET_BENEFICIARIES_TOPIC, SET_MAX_INTERVAL_TOPIC, SET_MIN_INTERVAL_TOPIC,
@@ -25,7 +26,7 @@ use types::{
     DISPUTE_FILED_TOPIC, DISPUTE_RESOLVED_TOPIC, WITHDRAWAL_SCHEDULED_TOPIC, WITHDRAWAL_EXECUTED_TOPIC,
     CONDITIONS_ACCEPTED_TOPIC, SET_SPENDING_LIMIT_TOPIC, SET_MAX_TTL_TOPIC, SET_DECAY_RATE_TOPIC,
     ACCEPTANCE_DEADLINE_EXPIRED_TOPIC, TTL_DECAY_TOPIC, SYNC_TTL_TOPIC, PASSKEY_EXPIRY_EXTENDED_TOPIC,
-    BENEFICIARY_ACCEPTED_TOPIC, BENEFICIARY_DECLINED_TOPIC, SET_RECOVERY_TOPIC, RECOVERY_EXTEND_TOPIC,
+    BENEFICIARY_ACCEPTED_TOPIC, BENEFICIARY_DECLINED_TOPIC, BENEFICIARY_CONDITION_ACCEPTED_TOPIC, SET_RECOVERY_TOPIC, RECOVERY_EXTEND_TOPIC,
     RESTORE_VAULT_TOPIC, PASSKEY_USAGE_TOPIC, VAULT_CLONED_TOPIC, VAULT_MERGED_TOPIC,
     MULTISIG_CONFIG_TOPIC, MULTISIG_PROPOSED_TOPIC, MULTISIG_APPROVED_TOPIC, MULTISIG_REJECTED_TOPIC,
     MULTISIG_EXECUTED_TOPIC, MULTISIG_PROPOSAL_EXPIRY, OWNERSHIP_INITIATED_TOPIC, OWNERSHIP_ACCEPTED_TOPIC,
@@ -1145,6 +1146,13 @@ impl TtlVaultContract {
         let beneficiary_status = Self::get_beneficiary_status(env.clone(), vault_id);
         if beneficiary_status == BeneficiaryStatus::Declined {
             panic_with_error!(&env, ContractError::InvalidBeneficiary);
+        }
+
+        // Check beneficiary conditional acceptance threshold - Issue #503
+        if !Self::check_conditional_acceptance_threshold(&env, vault_id, total)
+            .unwrap_or(false)
+        {
+            panic_with_error!(&env, ContractError::InsufficientBalance);
         }
 
         // Check beneficiary proof of life - Issue #498
@@ -4500,6 +4508,75 @@ impl TtlVaultContract {
         );
         env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
         Ok(())
+    }
+
+    // --- Issue #503: Beneficiary Conditional Acceptance with Threshold ---
+
+    /// Beneficiary accepts role conditionally with minimum balance threshold.
+    /// Only accepts if vault balance >= min_balance_threshold at release time.
+    pub fn accept_with_threshold(
+        env: Env,
+        vault_id: u64,
+        min_balance_threshold: i128,
+    ) -> Result<(), ContractError> {
+        Self::assert_not_paused(&env);
+        let vault = Self::load_vault(&env, vault_id);
+        vault.beneficiary.require_auth();
+
+        if min_balance_threshold <= 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        let acceptance = BeneficiaryConditionalAcceptance {
+            min_balance_threshold,
+            accepted_at: env.ledger().timestamp(),
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::BeneficiaryConditionalAcceptance(vault_id), &acceptance);
+
+        env.events().publish(
+            (BENEFICIARY_CONDITION_ACCEPTED_TOPIC,),
+            (vault_id, vault.beneficiary.clone(), min_balance_threshold),
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::BeneficiaryConditionalAcceptance(vault_id),
+            VAULT_TTL_THRESHOLD,
+            vault_ttl_ledgers(vault.check_in_interval),
+        );
+        Ok(())
+    }
+
+    /// Gets beneficiary conditional acceptance if it exists.
+    pub fn get_beneficiary_conditional_acceptance(
+        env: Env,
+        vault_id: u64,
+    ) -> Option<BeneficiaryConditionalAcceptance> {
+        env.storage()
+            .persistent()
+            .get::<DataKey, BeneficiaryConditionalAcceptance>(
+                &DataKey::BeneficiaryConditionalAcceptance(vault_id),
+            )
+    }
+
+    /// Checks if beneficiary conditional acceptance conditions are met.
+    fn check_conditional_acceptance_threshold(
+        env: &Env,
+        vault_id: u64,
+        current_balance: i128,
+    ) -> Result<bool, ContractError> {
+        if let Some(acceptance) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, BeneficiaryConditionalAcceptance>(
+                &DataKey::BeneficiaryConditionalAcceptance(vault_id),
+            )
+        {
+            Ok(current_balance >= acceptance.min_balance_threshold)
+        } else {
+            Ok(true)
+        }
     }
 
     // --- Issue #399: Dispute Resolution ---
