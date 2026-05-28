@@ -142,6 +142,7 @@ pub enum DataKey {
     VaultPasskeys(u64),
     BackupCodes(u64),
     BeneficiaryDelegate(u64),
+    BeneficiaryDelegationChain(u64),
     WithdrawalSchedule(u64),
     DisputeStatus(u64),
     ConditionalAcceptance(u64),
