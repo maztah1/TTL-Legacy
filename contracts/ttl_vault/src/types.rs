@@ -135,6 +135,19 @@ pub const CLAWBACK_UNVESTED_TOPIC: Symbol = symbol_short!("clawback");
 pub const PASSKEY_EXPIRED_TOPIC: Symbol = symbol_short!("pk_expd");
 // Issue #550: passkey compromise detected or reported
 pub const PASSKEY_COMPROMISED_TOPIC: Symbol = symbol_short!("pk_comp");
+// Issue #564: withdrawal approval workflow
+pub const WITHDRAWAL_APPROVAL_REQUESTED_TOPIC: Symbol = symbol_short!("wd_req");
+pub const WITHDRAWAL_APPROVAL_GRANTED_TOPIC: Symbol = symbol_short!("wd_grant");
+pub const WITHDRAWAL_APPROVAL_DENIED_TOPIC: Symbol = symbol_short!("wd_deny");
+// Issue #563: passkey recovery
+pub const PASSKEY_RECOVERY_INITIATED_TOPIC: Symbol = symbol_short!("pk_rec");
+pub const PASSKEY_RECOVERED_TOPIC: Symbol = symbol_short!("pk_rcvd");
+// Issue #562: passkey compromise response
+pub const PASSKEY_LOCKOUT_TOPIC: Symbol = symbol_short!("pk_lock");
+pub const PASSKEY_UNLOCKED_TOPIC: Symbol = symbol_short!("pk_unlk");
+// Issue #561: passkey rotation enforcement
+pub const PASSKEY_ROTATION_REQUIRED_TOPIC: Symbol = symbol_short!("pk_rot_r");
+pub const PASSKEY_ROTATION_ENFORCED_TOPIC: Symbol = symbol_short!("pk_rot_e");
 
 // Issue: TTL Borrowing
 pub const TTL_BORROW_TOPIC: Symbol = symbol_short!("ttl_bor");
