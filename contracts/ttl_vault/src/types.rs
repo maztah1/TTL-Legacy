@@ -98,6 +98,18 @@ pub const DUPLICATE_VAULT_TOPIC: Symbol = symbol_short!("dup_vault");
 pub const MIN_THRESHOLD_SET_TOPIC: Symbol = symbol_short!("min_thr");
 pub const MIN_THRESHOLD_SKIP_TOPIC: Symbol = symbol_short!("min_skip");
 pub const MIN_THRESHOLD_REDISTRIBUTE_TOPIC: Symbol = symbol_short!("min_rdst");
+// Issue #565: withdrawal scheduling validation
+pub const WITHDRAWAL_VALIDATION_TOPIC: Symbol = symbol_short!("wd_val");
+// Issue #566: withdrawal limits by time
+pub const WITHDRAWAL_LIMIT_SET_TOPIC: Symbol = symbol_short!("wd_lim");
+pub const WITHDRAWAL_LIMIT_EXCEEDED_TOPIC: Symbol = symbol_short!("wd_exc");
+// Issue #567: withdrawal destination whitelist
+pub const WHITELIST_ADDED_TOPIC: Symbol = symbol_short!("wl_add");
+pub const WHITELIST_REMOVED_TOPIC: Symbol = symbol_short!("wl_rem");
+pub const WHITELIST_VIOLATION_TOPIC: Symbol = symbol_short!("wl_vio");
+// Issue #568: withdrawal reversal
+pub const WITHDRAWAL_REVERSED_TOPIC: Symbol = symbol_short!("wd_rev");
+pub const REVERSAL_GRACE_EXPIRED_TOPIC: Symbol = symbol_short!("rev_exp");
 // Issue #547: vesting penalty applied
 pub const VESTING_PENALTY_TOPIC: Symbol = symbol_short!("vest_pen");
 // Issue #548: vesting claim reversed / finalized
@@ -159,29 +171,31 @@ pub const ARBITRATION_RULED_TOPIC: Symbol = symbol_short!("arb_rul");
 // Issue #497: Beneficiary Notification
 pub const VAULT_NOTIFY_TOPIC: Symbol = symbol_short!("v_notif");
 
-// Issue #577: Withdrawal Confirmation
-pub const WITHDRAWAL_CONFIRMATION_REQUESTED_TOPIC: Symbol = symbol_short!("wd_conf_req");
-pub const WITHDRAWAL_CONFIRMATION_CONFIRMED_TOPIC: Symbol = symbol_short!("wd_conf_ok");
-pub const WITHDRAWAL_CONFIRMATION_EXPIRED_TOPIC: Symbol = symbol_short!("wd_conf_exp");
+// Issue #569: Withdrawal Audit Trail
+pub const WITHDRAWAL_AUDIT_TOPIC: Symbol = symbol_short!("wd_audit");
+pub const WITHDRAWAL_FAILED_TOPIC: Symbol = symbol_short!("wd_fail");
 
-// Issue #578: Withdrawal Delegation
-pub const WITHDRAWAL_DELEGATE_ADDED_TOPIC: Symbol = symbol_short!("wd_del_add");
-pub const WITHDRAWAL_DELEGATE_REMOVED_TOPIC: Symbol = symbol_short!("wd_del_rem");
-pub const WITHDRAWAL_BY_DELEGATE_TOPIC: Symbol = symbol_short!("wd_by_del");
+// Issue #571: Withdrawal Notifications
+pub const WITHDRAWAL_NOTIF_TOPIC: Symbol = symbol_short!("wd_notif");
 
-// Issue #579: Multi-Token Vault Support
-pub const TOKEN_ADDED_TOPIC: Symbol = symbol_short!("tok_add");
-pub const TOKEN_REMOVED_TOPIC: Symbol = symbol_short!("tok_rem");
-pub const TOKEN_BALANCE_UPDATED_TOPIC: Symbol = symbol_short!("tok_bal");
-
-// Issue #580: Token Swap on Release
-pub const TOKEN_SWAP_CONFIGURED_TOPIC: Symbol = symbol_short!("swap_cfg");
-pub const TOKEN_SWAP_EXECUTED_TOPIC: Symbol = symbol_short!("swap_exec");
+// Issue #572: Withdrawal Dispute
+pub const WITHDRAWAL_DISPUTE_FILED_TOPIC: Symbol = symbol_short!("wd_disp");
+pub const WITHDRAWAL_DISPUTE_RESOLVED_TOPIC: Symbol = symbol_short!("wd_disp_res");
 
 pub const BENEFICIARY_TRIGGER_SET_TOPIC: Symbol = symbol_short!("ben_trg");
 pub const BENEFICIARY_TIER_SET_TOPIC: Symbol = symbol_short!("ben_tier");
 pub const BENEFICIARY_WATERFALL_TOPIC: Symbol = symbol_short!("ben_wfl");
 pub const BENEFICIARY_REBALANCED_TOPIC: Symbol = symbol_short!("ben_reb");
+
+// Issue #573: Withdrawal Proof
+pub const WITHDRAWAL_PROOF_TOPIC: Symbol = symbol_short!("wd_prf");
+// Issue #574: Withdrawal Rollback
+pub const WITHDRAWAL_ROLLBACK_TOPIC: Symbol = symbol_short!("wd_rbk");
+// Issue #575: Withdrawal Rate Limiting
+pub const WITHDRAWAL_RATE_LIMITED_TOPIC: Symbol = symbol_short!("wd_rl");
+// Issue #576: Withdrawal Escrow
+pub const WITHDRAWAL_ESCROW_CREATED_TOPIC: Symbol = symbol_short!("wd_esc");
+pub const WITHDRAWAL_ESCROW_VERIFIED_TOPIC: Symbol = symbol_short!("wd_ver");
 
 /// Warning threshold in seconds. If TTL remaining < this value, ping_expiry emits an event.
 pub const EXPIRY_WARNING_THRESHOLD: u64 = 86_400; // 24 hours
@@ -263,6 +277,8 @@ pub enum DataKey {
     BeneficiaryReleaseTriggers(u64),
     BeneficiaryTierThreshold(u64, Address),
     BeneficiaryStatusEntry(u64, Address),
+    // Issue: beneficiary veto of owner-defined release conditions before expiry
+    BeneficiaryReleaseConditionVeto(u64),
     // Hibernation: temporary suspension of check-in requirement
     Hibernation(u64),
     LastCheckInTime(u64),
@@ -273,16 +289,16 @@ pub enum DataKey {
     TtlBorrow(u64),
     // Issue #553: encrypted backup codes
     EncryptedBackupCodes(u64),
-    // Issue #577: Withdrawal Confirmation
-    WithdrawalConfirmation(u64),
-    // Issue #578: Withdrawal Delegation
-    WithdrawalDelegates(u64),
-    // Issue #579: Multi-Token Vault Support
-    VaultTokenBalances(u64),
-    // Issue #580: Token Swap on Release
-    TokenSwapConfig(u64),
-    // Countdown notification fired bitmask
-    CountdownFired(u64),
+    // Issue #565: withdrawal scheduling validation
+    WithdrawalScheduleValidation(u64),
+    // Issue #566: withdrawal limits by time
+    WithdrawalLimit(u64),
+    WithdrawalTracker(u64),
+    // Issue #567: withdrawal destination whitelist
+    WithdrawalWhitelist(u64),
+    // Issue #568: withdrawal reversal
+    WithdrawalReversal(u64, u64), // (vault_id, withdrawal_id)
+    WithdrawalReversalCounter(u64),
 }
 
 /// Check-in history entry for TTL prediction - Issue #482
@@ -445,6 +461,49 @@ pub struct DepositProof {
     pub amount: i128,
     pub timestamp: u64,
     pub proof_hash: BytesN<32>,
+}
+
+/// Withdrawal proof for compliance - Issue #573
+#[contracttype]
+#[derive(Clone)]
+pub struct WithdrawalProof {
+    pub vault_id: u64,
+    pub amount: i128,
+    pub timestamp: u64,
+    pub proof_hash: BytesN<32>,
+    pub nonce: u64,
+}
+
+/// Withdrawal escrow entry - Issue #576
+#[contracttype]
+#[derive(Clone)]
+pub struct WithdrawalEscrow {
+    pub vault_id: u64,
+    pub amount: i128,
+    pub timestamp: u64,
+    pub beneficiary: Address,
+    pub verified: bool,
+}
+
+/// Withdrawal rollback entry - Issue #574
+#[contracttype]
+#[derive(Clone)]
+pub struct WithdrawalRollback {
+    pub vault_id: u64,
+    pub original_amount: i128,
+    pub rollback_amount: i128,
+    pub timestamp: u64,
+    pub reason: String,
+}
+
+/// Withdrawal rate limit entry - Issue #575
+#[contracttype]
+#[derive(Clone)]
+pub struct WithdrawalRateLimit {
+    pub vault_id: u64,
+    pub last_withdrawal_time: u64,
+    pub withdrawal_count: u32,
+    pub cooldown_seconds: u64,
 }
 
 #[contracttype]
@@ -661,6 +720,31 @@ pub struct AuditEntry {
     pub details: String,
 }
 
+/// Withdrawal audit trail entry - Issue #569
+#[contracttype]
+#[derive(Clone)]
+pub struct WithdrawalAuditEntry {
+    pub vault_id: u64,
+    pub caller: Address,
+    pub amount: i128,
+    pub timestamp: u64,
+    pub success: bool,
+    pub error_reason: String,
+}
+
+/// Withdrawal dispute entry - Issue #572
+#[contracttype]
+#[derive(Clone)]
+pub struct WithdrawalDispute {
+    pub vault_id: u64,
+    pub withdrawal_timestamp: u64,
+    pub dispute_filed_at: u64,
+    pub dispute_expires_at: u64,
+    pub status: DisputeStatus,
+    pub reason: String,
+    pub resolved_at: Option<u64>,
+}
+
 /// Multi-signature configuration
 #[contracttype]
 #[derive(Clone)]
@@ -820,7 +904,9 @@ pub struct ReleaseVoteEntry {
 #[derive(Clone)]
 pub struct BeneficiaryRotationEntry {
     pub effective_timestamp: u64,
-    pub new_beneficiaries: Vec<BeneficiaryEntry>,
+pub new_beneficiaries: Vec<BeneficiaryEntry>,
+}
+
 /// Configurable countdown notification thresholds for a vault.
 /// Each threshold (in seconds before expiry) triggers a `cd_notif` event
 /// when `check_countdown` is called and the TTL crosses that boundary.
@@ -832,43 +918,43 @@ pub struct CountdownConfig {
     pub thresholds: Vec<u64>,
 }
 
-// Issue #577: Withdrawal Confirmation
-/// Pending withdrawal confirmation request
+/// Withdrawal limit configuration - Issue #566
 #[contracttype]
 #[derive(Clone)]
-pub struct WithdrawalConfirmation {
-    pub vault_id: u64,
-    pub amount: i128,
-    pub requested_at: u64,
-    pub confirmation_deadline: u64,
-    pub confirmed: bool,
+pub struct WithdrawalLimit {
+    pub daily_limit: i128,
+    pub weekly_limit: i128,
+    pub monthly_limit: i128,
 }
 
-// Issue #578: Withdrawal Delegation
-/// Withdrawal delegate entry
+/// Withdrawal tracking entry - Issue #566
 #[contracttype]
 #[derive(Clone)]
-pub struct WithdrawalDelegate {
-    pub delegate: Address,
+pub struct WithdrawalTracker {
+    pub daily_withdrawn: i128,
+    pub daily_reset_at: u64,
+    pub weekly_withdrawn: i128,
+    pub weekly_reset_at: u64,
+    pub monthly_withdrawn: i128,
+    pub monthly_reset_at: u64,
+}
+
+/// Withdrawal destination whitelist entry - Issue #567
+#[contracttype]
+#[derive(Clone)]
+pub struct WhitelistEntry {
+    pub address: Address,
     pub added_at: u64,
-    pub max_amount: Option<i128>,
+    pub label: String,
 }
 
-// Issue #579: Multi-Token Vault Support
-/// Token balance entry for multi-token vaults
+/// Withdrawal reversal entry - Issue #568
 #[contracttype]
 #[derive(Clone)]
-pub struct TokenBalance {
-    pub token_address: Address,
-    pub balance: i128,
-}
-
-// Issue #580: Token Swap on Release
-/// Token swap configuration for release
-#[contracttype]
-#[derive(Clone)]
-pub struct TokenSwapConfig {
-    pub from_token: Address,
-    pub to_token: Address,
-    pub min_output_amount: i128,
+pub struct WithdrawalReversal {
+    pub withdrawal_id: u64,
+    pub amount: i128,
+    pub withdrawn_at: u64,
+    pub grace_period_until: u64,
+    pub reversed: bool,
 }
