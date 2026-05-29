@@ -1,10 +1,10 @@
 use crate::models::*;
 use crate::db::*;
-use crate::notifications::NotificationService;
 use chrono::Utc;
 use serde_json::json;
 use std::io::Write;
 use std::sync::Arc;
+
 
 pub fn search_vaults_handler(
     store: &VaultStore,

@@ -184,6 +184,48 @@ pub enum VaultStatus {
     Paused,
 }
 
+// ── TTL Insurance models ───────────────────────────────────────────────────
+
+/// TTL insurance policy parameters purchased by a vault owner.
+///
+/// When enabled, the backend scheduler can automatically extend TTL once the
+/// owner is considered inactive.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TtlInsurancePolicy {
+    /// Vault id (matches `Vault.id` semantics in this backend).
+    pub vault_id: u64,
+    /// How much TTL to extend when triggered.
+    pub extension_seconds: u64,
+    /// Consider the owner inactive if no proof-of-life/check-in was recorded
+    /// within this window.
+    pub inactivity_threshold_seconds: u64,
+    /// Whether this policy is currently active.
+    pub enabled: bool,
+    pub purchased_at: DateTime<Utc>,
+    pub last_extended_at: Option<DateTime<Utc>>,
+}
+
+/// Persisted owner activity signal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OwnerActivity {
+    pub owner_id: u64,
+    pub last_active_at: DateTime<Utc>,
+}
+
+/// POST body to purchase/enable a TTL insurance policy.
+#[derive(Debug, Deserialize, Clone)]
+pub struct PurchaseTtlInsuranceRequest {
+    pub extension_seconds: u64,
+    pub inactivity_threshold_seconds: u64,
+}
+
+/// POST body to record owner activity (proof-of-life).
+#[derive(Debug, Deserialize, Clone)]
+pub struct RecordOwnerActivityRequest {
+    pub owner_id: u64,
+}
+
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultEvent {
     pub vault_id: String,
