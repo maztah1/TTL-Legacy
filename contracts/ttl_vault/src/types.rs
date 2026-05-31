@@ -206,6 +206,12 @@ pub const TOKEN_HEDGE_CLOSE_TOPIC: Symbol = symbol_short!("tok_hcls");
 pub const TOKEN_REBALANCE_TOPIC: Symbol = symbol_short!("tok_rebl");
 pub const TOKEN_REBALANCED_TOPIC: Symbol = symbol_short!("tok_rebd");
 
+// Issue #526: beneficiary post-release clawback
+pub const FUNDS_CLAWEDBACK_TOPIC: Symbol = symbol_short!("clawback");
+pub const BEN_RELEASED_TOPIC: Symbol = symbol_short!("ben_rls");
+/// 7-day grace window (in seconds) after a beneficiary release during which the owner may clawback.
+pub const GRACE_PERIOD_SECONDS: u64 = 7 * 24 * 60 * 60;
+
 // Vault state snapshots
 pub const SNAPSHOT_CREATED_TOPIC: Symbol = symbol_short!("snap_crt");
 pub const SNAPSHOT_RESTORED_TOPIC: Symbol = symbol_short!("snap_rst");
@@ -406,6 +412,8 @@ pub enum DataKey {
     TokenHedge(u64),
     // Issue #588: token rebalancing
     TokenRebalance(u64),
+    // Issue #526: beneficiary post-release clawback (vault_id, beneficiary_address) => release timestamp
+    ClawbackReleaseTs(u64, Address),
 }
 
 /// Check-in history entry for TTL prediction - Issue #482

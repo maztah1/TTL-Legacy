@@ -73,9 +73,12 @@ use types::{
     TokenCollateral, TOKEN_COLLATERAL_TOPIC, TOKEN_COLLAT_RLSD_TOPIC,
     TokenHedge, TOKEN_HEDGE_TOPIC, TOKEN_HEDGE_CLOSE_TOPIC,
     TokenWeight, TokenRebalanceConfig, TOKEN_REBALANCE_TOPIC, TOKEN_REBALANCED_TOPIC,
+    FUNDS_CLAWEDBACK_TOPIC, BEN_RELEASED_TOPIC, GRACE_PERIOD_SECONDS,
 };
 #[cfg(test)]
 mod regression_tests;
+#[cfg(test)]
+mod beneficiary_clawback_tests;
 
 /// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.
@@ -208,6 +211,10 @@ pub enum ContractError {
     // Issue #546: vesting bonus
     BonusNotEnabled = 73,
     TokenNotWhitelisted = 74,
+    // Issue #526: post-release clawback
+    NotReleased = 75,
+    GracePeriodExpired = 76,
+    NothingToClawback = 77,
 }
 
 #[contract]
@@ -10520,5 +10527,107 @@ impl TtlVaultContract {
     /// Returns the token rebalancing configuration for a vault.
     pub fn get_token_rebalance(env: Env, vault_id: u64) -> Option<TokenRebalanceConfig> {
         env.storage().persistent().get(&DataKey::TokenRebalance(vault_id))
+    }
+
+    // ── Issue #526: post-release clawback ─────────────────────────────────
+
+    /// Records that `beneficiary` has been released from `vault_id` at the current
+    /// ledger timestamp, opening the `GRACE_PERIOD_SECONDS` clawback window.
+    ///
+    /// Must be called by the vault owner immediately after funds are disbursed.
+    ///
+    /// # Errors
+    /// * `ContractError::NotOwner` - caller is not the vault owner
+    pub fn mark_beneficiary_released(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        beneficiary: Address,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        Self::assert_not_paused(&env);
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        let now = env.ledger().timestamp();
+        let key = DataKey::ClawbackReleaseTs(vault_id, beneficiary.clone());
+        env.storage().persistent().set(&key, &now);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((BEN_RELEASED_TOPIC, vault_id), (beneficiary, now));
+        Ok(())
+    }
+
+    /// Reclaims a beneficiary's allocation back to the vault within the post-release
+    /// grace period - Issue #526.
+    ///
+    /// The grace period is `GRACE_PERIOD_SECONDS` (7 days) from the timestamp recorded
+    /// by `mark_beneficiary_released`. After it expires this function returns an error.
+    /// The beneficiary's BPS is zeroed so they receive nothing on any future distribution.
+    ///
+    /// # Arguments
+    /// * `vault_id`     - The vault to operate on
+    /// * `caller`       - Must be the vault owner
+    /// * `beneficiary`  - The beneficiary whose allocation is reclaimed
+    ///
+    /// # Errors
+    /// * `ContractError::NotOwner`         - caller is not the vault owner
+    /// * `ContractError::NotReleased`      - beneficiary was never marked released
+    /// * `ContractError::GracePeriodExpired` - grace window has closed
+    pub fn clawback_post_release(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        beneficiary: Address,
+    ) -> Result<u32, ContractError> {
+        caller.require_auth();
+        Self::assert_not_paused(&env);
+        let mut vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+
+        let key = DataKey::ClawbackReleaseTs(vault_id, beneficiary.clone());
+        let release_ts: u64 = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::NotReleased)?;
+
+        let now = env.ledger().timestamp();
+        if now > release_ts + GRACE_PERIOD_SECONDS {
+            return Err(ContractError::GracePeriodExpired);
+        }
+
+        // Zero out the beneficiary's BPS allocation
+        let mut reclaimed_bps: u32 = 0;
+        for i in 0..vault.beneficiaries.len() {
+            let mut entry = vault.beneficiaries.get(i).unwrap();
+            if entry.address == beneficiary {
+                reclaimed_bps = entry.bps;
+                entry.bps = 0;
+                vault.beneficiaries.set(i, entry);
+                break;
+            }
+        }
+
+        // Clear the release record so clawback cannot be called twice
+        env.storage().persistent().remove(&key);
+
+        Self::save_vault(&env, vault_id, &vault);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish(
+            (FUNDS_CLAWEDBACK_TOPIC, vault_id),
+            (beneficiary, reclaimed_bps),
+        );
+        Ok(reclaimed_bps)
+    }
+
+    /// Returns the release timestamp for `beneficiary` in `vault_id`, if set.
+    pub fn get_release_timestamp(env: Env, vault_id: u64, beneficiary: Address) -> Option<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ClawbackReleaseTs(vault_id, beneficiary))
     }
 }
