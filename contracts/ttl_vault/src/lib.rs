@@ -73,9 +73,12 @@ use types::{
     TokenCollateral, TOKEN_COLLATERAL_TOPIC, TOKEN_COLLAT_RLSD_TOPIC,
     TokenHedge, TOKEN_HEDGE_TOPIC, TOKEN_HEDGE_CLOSE_TOPIC,
     TokenWeight, TokenRebalanceConfig, TOKEN_REBALANCE_TOPIC, TOKEN_REBALANCED_TOPIC,
+    RoundingMode, ROUNDING_MODE_TOPIC,
 };
 #[cfg(test)]
 mod regression_tests;
+#[cfg(test)]
+mod beneficiary_rounding_tests;
 
 /// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.
@@ -10520,5 +10523,61 @@ impl TtlVaultContract {
     /// Returns the token rebalancing configuration for a vault.
     pub fn get_token_rebalance(env: Env, vault_id: u64) -> Option<TokenRebalanceConfig> {
         env.storage().persistent().get(&DataKey::TokenRebalance(vault_id))
+    }
+
+    // ── Issue #524: configurable BPS rounding rules ───────────────────────
+
+    /// Sets the rounding mode used when computing per-beneficiary share amounts - Issue #524.
+    ///
+    /// Rounding is applied **only at distribution time**; BPS storage is never mutated,
+    /// so there is zero migration risk and total BPS remains 10 000.
+    ///
+    /// | Mode  | Formula                                  |
+    /// |-------|------------------------------------------|
+    /// | Floor | `value / divisor`  (default)             |
+    /// | Ceil  | `(value + divisor - 1) / divisor`        |
+    /// | Round | `(value + divisor / 2) / divisor`        |
+    ///
+    /// # Errors
+    /// * `ContractError::NotOwner` - caller is not the vault owner
+    pub fn set_rounding_mode(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        mode: RoundingMode,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        Self::assert_not_paused(&env);
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        let key = DataKey::VaultRoundingMode(vault_id);
+        env.storage().persistent().set(&key, &mode);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((ROUNDING_MODE_TOPIC, vault_id), mode as u32);
+        Ok(())
+    }
+
+    /// Returns the active rounding mode for `vault_id` (defaults to `RoundingMode::Floor`).
+    pub fn get_rounding_mode(env: Env, vault_id: u64) -> RoundingMode {
+        env.storage()
+            .persistent()
+            .get(&DataKey::VaultRoundingMode(vault_id))
+            .unwrap_or(RoundingMode::Floor)
+    }
+
+    /// Applies the vault's configured rounding mode to `value / divisor`.
+    ///
+    /// This is a **pure computation helper** — call it during any distribution pass to
+    /// avoid sub-stroop dust without altering stored BPS.
+    pub fn apply_rounding(env: Env, vault_id: u64, value: i128, divisor: i128) -> i128 {
+        let mode = Self::get_rounding_mode(env, vault_id);
+        match mode {
+            RoundingMode::Ceil  => (value + divisor - 1) / divisor,
+            RoundingMode::Round => (value + divisor / 2) / divisor,
+            RoundingMode::Floor => value / divisor,
+        }
     }
 }

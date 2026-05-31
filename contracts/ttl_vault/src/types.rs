@@ -206,6 +206,19 @@ pub const TOKEN_HEDGE_CLOSE_TOPIC: Symbol = symbol_short!("tok_hcls");
 pub const TOKEN_REBALANCE_TOPIC: Symbol = symbol_short!("tok_rebl");
 pub const TOKEN_REBALANCED_TOPIC: Symbol = symbol_short!("tok_rebd");
 
+// Issue #524: configurable BPS rounding mode
+pub const ROUNDING_MODE_TOPIC: Symbol = symbol_short!("rnd_mode");
+
+/// Rounding strategy applied at distribution time to prevent sub-stroop dust - Issue #524.
+/// BPS storage is never mutated; rounding is applied only when computing share amounts.
+#[contracttype]
+#[derive(Clone, Copy, PartialEq)]
+pub enum RoundingMode {
+    Floor = 0,
+    Ceil  = 1,
+    Round = 2,
+}
+
 // Vault state snapshots
 pub const SNAPSHOT_CREATED_TOPIC: Symbol = symbol_short!("snap_crt");
 pub const SNAPSHOT_RESTORED_TOPIC: Symbol = symbol_short!("snap_rst");
@@ -406,6 +419,8 @@ pub enum DataKey {
     TokenHedge(u64),
     // Issue #588: token rebalancing
     TokenRebalance(u64),
+    // Issue #524: vault-level rounding mode
+    VaultRoundingMode(u64),
 }
 
 /// Check-in history entry for TTL prediction - Issue #482
