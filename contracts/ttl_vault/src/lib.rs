@@ -83,6 +83,8 @@ mod regression_tests;
 mod beneficiary_pooling_tests;
 #[cfg(test)]
 mod beneficiary_vesting_auction_tests;
+#[cfg(test)]
+mod beneficiary_vesting_tests;
 
 /// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.
