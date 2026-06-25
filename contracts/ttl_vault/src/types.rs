@@ -14,6 +14,7 @@ pub const OWNERSHIP_TOPIC: Symbol = symbol_short!("own_xfer");
 pub const OWNERSHIP_INITIATED_TOPIC: Symbol = symbol_short!("own_init");
 pub const OWNERSHIP_ACCEPTED_TOPIC: Symbol = symbol_short!("own_acc");
 pub const OWNERSHIP_CANCELLED_TOPIC: Symbol = symbol_short!("own_can");
+pub const OWNERSHIP_TRANSFER_EXPIRED_TOPIC: Symbol = symbol_short!("own_exp");
 pub const BENEFICIARY_UPDATED_TOPIC: Symbol = symbol_short!("ben_upd");
 pub const SET_BENEFICIARIES_TOPIC: Symbol = symbol_short!("set_bens");
 pub const UPDATE_INTERVAL_TOPIC: Symbol = symbol_short!("upd_intv");

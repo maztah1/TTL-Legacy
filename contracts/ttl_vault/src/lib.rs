@@ -43,7 +43,7 @@ use types::{
     PASSKEY_RECOVERY_INITIATED_TOPIC, PASSKEY_RECOVERED_TOPIC,
     PASSKEY_LOCKOUT_TOPIC, PASSKEY_UNLOCKED_TOPIC,
     PASSKEY_ROTATION_REQUIRED_TOPIC, PASSKEY_ROTATION_ENFORCED_TOPIC,
-    OWNERSHIP_CANCELLED_TOPIC, MIN_THRESHOLD_SET_TOPIC, MIN_THRESHOLD_SKIP_TOPIC, MIN_THRESHOLD_REDISTRIBUTE_TOPIC,
+    OWNERSHIP_CANCELLED_TOPIC, OWNERSHIP_TRANSFER_EXPIRED_TOPIC, MIN_THRESHOLD_SET_TOPIC, MIN_THRESHOLD_SKIP_TOPIC, MIN_THRESHOLD_REDISTRIBUTE_TOPIC,
     DUPLICATE_VAULT_TOPIC,
     MetadataVersionEntry, META_VERSION_TOPIC, META_REVERT_TOPIC, VAULT_ARCHIVED_TOPIC,
     VAULT_CAP_TOPIC, BENEFICIARY_CAP_TOPIC,
@@ -5472,6 +5472,31 @@ impl TtlVaultContract {
         Self::log_audit_entry(&env, vault_id, "cancel_ownership_transfer", &caller, "");
         env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
         env.events().publish((OWNERSHIP_CANCELLED_TOPIC, vault_id), (caller, cancelled_new_owner, reason));
+        Ok(())
+    }
+
+    /// Expires a stale ownership transfer request after the 7-day expiry window.
+    ///
+    /// Callable by anyone once the request has passed its `expires_at` timestamp.
+    /// Emits `OWNERSHIP_TRANSFER_EXPIRED_TOPIC` and removes the pending request.
+    pub fn expire_ownership_transfer(env: Env, vault_id: u64) -> Result<(), ContractError> {
+        let key = DataKey::PendingOwnership(vault_id);
+        let request = env
+            .storage()
+            .persistent()
+            .get::<DataKey, OwnershipTransferRequest>(&key)
+            .ok_or(ContractError::NoPendingOwnershipTransfer)?;
+
+        if env.ledger().timestamp() <= request.expires_at {
+            return Err(ContractError::NotExpired);
+        }
+
+        env.storage().persistent().remove(&key);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish(
+            (OWNERSHIP_TRANSFER_EXPIRED_TOPIC, vault_id),
+            (request.new_owner,),
+        );
         Ok(())
     }
 

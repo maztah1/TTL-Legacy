@@ -616,6 +616,33 @@ fn test_accept_ownership_transfer_emits_accepted_event() {
 }
 
 #[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn test_expire_ownership_transfer_before_expiry_fails() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let new_owner = Address::generate(&env);
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    client.initiate_ownership_transfer(&vault_id, &owner, &new_owner);
+    // Not yet expired — should fail with NotExpired (#16)
+    client.expire_ownership_transfer(&vault_id);
+}
+
+#[test]
+fn test_expire_ownership_transfer_after_expiry_succeeds() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let new_owner = Address::generate(&env);
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    client.initiate_ownership_transfer(&vault_id, &owner, &new_owner);
+    // Advance past OWNERSHIP_TRANSFER_EXPIRY (604_800 seconds)
+    env.ledger().with_mut(|l| l.timestamp += 604_801);
+    client.expire_ownership_transfer(&vault_id);
+
+    assert!(client.get_pending_ownership_transfer(&vault_id).is_none());
+    assert!(find_event_by_topic(&env, types::OWNERSHIP_TRANSFER_EXPIRED_TOPIC));
+}
+
+#[test]
 fn test_cancel_vault_refunds_owner_and_marks_cancelled() {
     let (env, owner, beneficiary, _, token_address, client) = setup();
 
