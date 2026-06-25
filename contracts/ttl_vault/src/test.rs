@@ -453,6 +453,15 @@ fn test_initiate_ownership_transfer_stores_pending_request() {
 }
 
 #[test]
+#[should_panic(expected = "Error(Contract, #82)")]
+fn test_initiate_ownership_transfer_to_current_owner_fails() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    // new_owner == current owner — should fail with AlreadyOwner (#82)
+    client.initiate_ownership_transfer(&vault_id, &owner, &owner);
+}
+
+#[test]
 #[should_panic(expected = "Error(Contract, #36)")]
 fn test_accept_ownership_transfer_before_timelock_fails() {
     let (env, owner, beneficiary, _, _, client) = setup();

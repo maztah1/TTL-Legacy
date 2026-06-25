@@ -228,6 +228,7 @@ pub enum ContractError {
     AuctionAlreadyExists = 79,
     AuctionEnded = 80,
     AuctionNotEnded = 81,
+    AlreadyOwner = 82,
 }
 
 #[contract]
@@ -5329,6 +5330,9 @@ impl TtlVaultContract {
         }
         if new_owner == vault.beneficiary {
             return Err(ContractError::InvalidBeneficiary);
+        }
+        if new_owner == vault.owner {
+            return Err(ContractError::AlreadyOwner);
         }
 
         let now = env.ledger().timestamp();
