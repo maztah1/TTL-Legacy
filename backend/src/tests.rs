@@ -26,6 +26,10 @@ fn test_app_with_db(db: Arc<Db>) -> Router {
             "/api/vaults/:vault_id/reminder-preferences",
             post(routes::set_preferences).get(routes::get_preferences),
         )
+        .route(
+            "/notifications/unsubscribe",
+            get(routes::unsubscribe),
+        )
         .with_state(db)
 }
 

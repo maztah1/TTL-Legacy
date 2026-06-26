@@ -141,6 +141,26 @@ impl Default for NotificationPreferences {
     }
 }
 
+// ── Unsubscribe support (#828) ──────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnsubscribeToken {
+    pub token: String,
+    pub owner: String,
+    pub created_at: DateTime<Utc>,
+}
+
+// ── Channel fallback delivery log (#827) ────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelDeliveryLog {
+    pub notification_id: String,
+    pub channel: NotificationChannel,
+    pub status: DeliveryStatus,
+    pub attempted_at: DateTime<Utc>,
+    pub error: Option<String>,
+}
+
 
 
 /// A scheduled notification (pending delivery).
@@ -460,5 +480,13 @@ pub struct NotificationPreferencesRequest {
     pub frequency: NotificationFrequency,
 }
 
+// ── Idempotency Key support (#825) ──────────────────────────────────────────
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdempotencyRecord {
+    pub key: String,
+    pub response_body: String,
+    pub status_code: u16,
+    pub created_at: DateTime<Utc>,
+}
 
