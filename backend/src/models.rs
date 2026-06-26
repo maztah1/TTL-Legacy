@@ -1,6 +1,26 @@
 use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
 
+// ── WebSocket authentication ────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthClaims {
+    pub sub: String,
+    pub vault_ids: Vec<String>,
+    pub exp: usize,
+}
+
+// ── Locale support ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum Locale {
+    En,
+    Es,
+    Fr,
+    De,
+}
+
 // ── Notification models ──────────────────────────────────────────────────────
 
 // ── Legacy reminder API models (axum + Db contract) ───────────────────────
@@ -101,6 +121,7 @@ pub struct NotificationPreferences {
     pub vault_released_enabled: bool,
     /// Hours before expiry to send the warning (default 24).
     pub warning_hours_before: u64,
+    pub locale: Option<Locale>,
 }
 
 impl Default for NotificationPreferences {
@@ -111,6 +132,7 @@ impl Default for NotificationPreferences {
             check_in_reminder_enabled: true,
             vault_released_enabled: true,
             warning_hours_before: 24,
+            locale: None,
         }
     }
 }
@@ -127,6 +149,7 @@ pub struct ScheduledNotification {
     /// Unix timestamp when this should fire.
     pub scheduled_at: DateTime<Utc>,
     pub status: DeliveryStatus,
+    pub max_retry_attempts: u32,
 }
 
 /// Delivery record written after each send attempt.
@@ -158,6 +181,7 @@ pub struct UpdatePreferencesRequest {
     pub check_in_reminder_enabled: Option<bool>,
     pub vault_released_enabled: Option<bool>,
     pub warning_hours_before: Option<u64>,
+    pub locale: Option<Locale>,
 }
 
 // ── Existing models (unchanged) ──────────────────────────────────────────────
