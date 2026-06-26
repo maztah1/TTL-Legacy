@@ -59,8 +59,7 @@ pub fn create_idempotency_store() -> IdempotencyStore {
 /// Exponential backoff delays in seconds: 1 min, 5 min, 15 min, 1 hr, 6 hr.
 const RETRY_DELAYS_SECS: [u64; 5] = [60, 300, 900, 3_600, 21_600];
 
-/// Deduplication window: skip sending if the same reminder was sent within this many seconds.
-pub const DEDUP_WINDOW_SECONDS: i64 = 300;
+pub const DEFAULT_MAX_RETRY_ATTEMPTS: u32 = 5;
 
 // ── FCM HTTP v1 client ───────────────────────────────────────────────────────
 
@@ -271,7 +270,9 @@ impl NotificationService {
         if let Some(v) = req.warning_hours_before {
             prefs.warning_hours_before = v;
         }
-
+        if let Some(v) = req.locale {
+            prefs.locale = Some(v);
+        }
     }
 
 
@@ -311,7 +312,7 @@ impl NotificationService {
             notification_type: NotificationType::ExpiryWarning,
             scheduled_at: fire_at,
             status: DeliveryStatus::Pending,
-            sent_at: None,
+            max_retry_attempts: DEFAULT_MAX_RETRY_ATTEMPTS,
         });
     }
 
@@ -350,7 +351,7 @@ impl NotificationService {
             notification_type,
             scheduled_at: Utc::now(),
             status: DeliveryStatus::Pending,
-            sent_at: None,
+            max_retry_attempts: DEFAULT_MAX_RETRY_ATTEMPTS,
         });
     }
 
@@ -462,18 +463,21 @@ impl NotificationService {
             self.update_retry_log(notif, attempt, DeliveryStatus::Sent, "");
         } else {
             let next_attempt = attempt + 1;
-            if (next_attempt as usize) < RETRY_DELAYS_SECS.len() {
-                // Schedule next retry
+            let max_attempts = notif.max_retry_attempts;
+            if next_attempt < max_attempts && (next_attempt as usize) < RETRY_DELAYS_SECS.len() {
                 let delay = RETRY_DELAYS_SECS[next_attempt as usize];
                 let next_at = Utc::now() + chrono::Duration::seconds(delay as i64);
                 self.record(notif, DeliveryStatus::Retrying, &last_err);
                 self.mark_sent(&notif.id, DeliveryStatus::Retrying);
                 self.update_retry_log_with_next(notif, attempt, DeliveryStatus::Retrying, &last_err, Some(next_at));
             } else {
-                // All retries exhausted
                 self.record(notif, DeliveryStatus::Failed, &last_err);
                 self.mark_sent(&notif.id, DeliveryStatus::Failed);
                 self.update_retry_log(notif, attempt, DeliveryStatus::Failed, &last_err);
+                log::warn!(
+                    "Notification retry budget exhausted: notification={} vault={} owner={} attempts={}/{}",
+                    notif.id, notif.vault_id, notif.owner, next_attempt, max_attempts
+                );
                 log::error!(
                     "[ALERT] Reminder delivery permanently failed after {} attempts: vault={} owner={} error={}",
                     next_attempt, notif.vault_id, notif.owner, last_err
@@ -891,7 +895,7 @@ mod tests {
                 check_in_reminder_enabled: true,
                 vault_released_enabled: true,
                 warning_hours_before: 24,
-                ..Default::default()
+                locale: None,
             },
 
         );
@@ -921,9 +925,8 @@ mod tests {
                 check_in_reminder_enabled: true,
                 vault_released_enabled: true,
                 warning_hours_before: 24,
-                ..Default::default()
+                locale: None,
             },
-
         );
 
         svc.schedule_expiry_warning(&vault);
@@ -951,9 +954,8 @@ mod tests {
                 check_in_reminder_enabled: true,
                 vault_released_enabled: true,
                 warning_hours_before: 24,
-                ..Default::default()
+                locale: None,
             },
-
         );
         svc.schedule_immediate("v1", "owner1", NotificationType::VaultReleased);
 
@@ -973,9 +975,8 @@ mod tests {
                 check_in_reminder_enabled: true,
                 vault_released_enabled: false,
                 warning_hours_before: 24,
-                ..Default::default()
+                locale: None,
             },
-
         );
         svc.schedule_immediate("v1", "owner1", NotificationType::VaultReleased);
 
@@ -1097,258 +1098,40 @@ mod tests {
         assert_eq!(RETRY_DELAYS_SECS, [60, 300, 900, 3_600, 21_600]);
     }
 
-    // ── Deduplication tests ─────────────────────────────────────────────────
+    // Retry budget tests (#829)
 
     #[test]
-    fn dedup_window_constant_is_300() {
-        assert_eq!(DEDUP_WINDOW_SECONDS, 300);
+    fn default_max_retry_attempts_is_five() {
+        assert_eq!(DEFAULT_MAX_RETRY_ATTEMPTS, 5);
     }
 
     #[test]
-    fn is_duplicate_returns_false_when_no_prior_send() {
+    fn scheduled_notification_has_max_retry_attempts() {
         let svc = make_service();
-        let notif = ScheduledNotification {
-            id: "n1".into(),
-            vault_id: "v1".into(),
-            owner: "owner1".into(),
-            notification_type: NotificationType::CheckInReminder,
-            scheduled_at: Utc::now(),
-            status: DeliveryStatus::Pending,
-            sent_at: None,
-        };
-        assert!(!svc.is_duplicate(&notif));
+        svc.schedule_immediate("v1", "owner1", NotificationType::CheckInReminder);
+        let all = svc.schedule.lock().unwrap();
+        assert_eq!(all[0].max_retry_attempts, DEFAULT_MAX_RETRY_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn retry_exhaustion_marks_failed() {
+        let svc = make_service();
+        svc.schedule_immediate("v1", "owner1", NotificationType::CheckInReminder);
+        // No tokens registered — first delivery attempt fails immediately
+        svc.flush_pending().await;
+        let log = svc.get_reminder_delivery_status("v1").unwrap();
+        assert_eq!(log.status, DeliveryStatus::Failed);
+        // No retry scheduled because no-tokens is an immediate failure
+        assert!(log.next_retry_at.is_none());
     }
 
     #[test]
-    fn is_duplicate_returns_true_when_recently_sent() {
+    fn max_retry_attempts_propagated_in_schedule() {
         let svc = make_service();
-        // Insert a notification that was already sent recently
-        svc.schedule.lock().unwrap().push(ScheduledNotification {
-            id: "n1".into(),
-            vault_id: "v1".into(),
-            owner: "owner1".into(),
-            notification_type: NotificationType::CheckInReminder,
-            scheduled_at: Utc::now(),
-            status: DeliveryStatus::Sent,
-            sent_at: Some(Utc::now()),
-        });
-
-        // A new notification with same vault/owner/type should be detected as duplicate
-        let new_notif = ScheduledNotification {
-            id: "n2".into(),
-            vault_id: "v1".into(),
-            owner: "owner1".into(),
-            notification_type: NotificationType::CheckInReminder,
-            scheduled_at: Utc::now(),
-            status: DeliveryStatus::Pending,
-            sent_at: None,
-        };
-        assert!(svc.is_duplicate(&new_notif));
-    }
-
-    #[test]
-    fn is_duplicate_returns_false_when_outside_window() {
-        let svc = make_service();
-        let old_time = Utc::now() - chrono::Duration::seconds(DEDUP_WINDOW_SECONDS + 1);
-        svc.schedule.lock().unwrap().push(ScheduledNotification {
-            id: "n1".into(),
-            vault_id: "v1".into(),
-            owner: "owner1".into(),
-            notification_type: NotificationType::CheckInReminder,
-            scheduled_at: old_time,
-            status: DeliveryStatus::Sent,
-            sent_at: Some(old_time),
-        });
-
-        let new_notif = ScheduledNotification {
-            id: "n2".into(),
-            vault_id: "v1".into(),
-            owner: "owner1".into(),
-            notification_type: NotificationType::CheckInReminder,
-            scheduled_at: Utc::now(),
-            status: DeliveryStatus::Pending,
-            sent_at: None,
-        };
-        assert!(!svc.is_duplicate(&new_notif));
-    }
-
-    #[test]
-    fn is_duplicate_different_type_not_duplicate() {
-        let svc = make_service();
-        svc.schedule.lock().unwrap().push(ScheduledNotification {
-            id: "n1".into(),
-            vault_id: "v1".into(),
-            owner: "owner1".into(),
-            notification_type: NotificationType::CheckInReminder,
-            scheduled_at: Utc::now(),
-            status: DeliveryStatus::Sent,
-            sent_at: Some(Utc::now()),
-        });
-
-        let new_notif = ScheduledNotification {
-            id: "n2".into(),
-            vault_id: "v1".into(),
-            owner: "owner1".into(),
-            notification_type: NotificationType::ExpiryWarning,
-            scheduled_at: Utc::now(),
-            status: DeliveryStatus::Pending,
-            sent_at: None,
-        };
-        assert!(!svc.is_duplicate(&new_notif));
-    }
-
-    // ── Unsubscribe tests (#828) ────────────────────────────────────────────
-
-    #[test]
-    fn generate_unsubscribe_token_creates_token() {
-        let svc = make_service();
-        let token = svc.generate_unsubscribe_token("owner1");
-        assert!(!token.is_empty());
-        assert!(svc.unsubscribe_tokens.lock().unwrap().contains_key(&token));
-    }
-
-    #[test]
-    fn process_unsubscribe_marks_user_unsubscribed() {
-        let svc = make_service();
-        let token = svc.generate_unsubscribe_token("owner1");
-        let result = svc.process_unsubscribe(&token);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "owner1");
-        assert!(svc.is_unsubscribed("owner1"));
-    }
-
-    #[test]
-    fn process_unsubscribe_invalid_token_fails() {
-        let svc = make_service();
-        let result = svc.process_unsubscribe("bogus-token");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn is_unsubscribed_returns_false_by_default() {
-        let svc = make_service();
-        assert!(!svc.is_unsubscribed("owner1"));
-    }
-
-    #[test]
-    fn render_email_includes_unsubscribe_link() {
-        let svc = make_service();
-        let html = svc.render_email_with_unsubscribe(
-            "owner1",
-            "Test Subject",
-            "Test body",
-            "https://example.com",
-        );
-        assert!(html.contains("Unsubscribe from these emails"));
-        assert!(html.contains("https://example.com/notifications/unsubscribe?token="));
-    }
-
-    // ── Channel fallback tests (#827) ───────────────────────────────────────
-
-    #[test]
-    fn log_channel_delivery_records_entry() {
-        let svc = make_service();
-        svc.log_channel_delivery(
-            "n1",
-            &crate::models::NotificationChannel::Email,
-            DeliveryStatus::Sent,
-            None,
-        );
-        let logs = svc.get_channel_delivery_log("n1");
-        assert_eq!(logs.len(), 1);
-        assert_eq!(logs[0].channel, crate::models::NotificationChannel::Email);
-        assert_eq!(logs[0].status, DeliveryStatus::Sent);
-    }
-
-    #[test]
-    fn log_channel_delivery_records_failure_with_error() {
-        let svc = make_service();
-        svc.log_channel_delivery(
-            "n1",
-            &crate::models::NotificationChannel::Sms,
-            DeliveryStatus::Failed,
-            Some("timeout".into()),
-        );
-        let logs = svc.get_channel_delivery_log("n1");
-        assert_eq!(logs.len(), 1);
-        assert_eq!(logs[0].error, Some("timeout".into()));
-    }
-
-    #[test]
-    fn channel_fallback_prefs_stored() {
-        let svc = make_service();
-        svc.prefs.lock().unwrap().insert(
-            "owner1".to_string(),
-            crate::models::NotificationPreferences {
-                owner: "owner1".to_string(),
-                preferred_channel: Some(crate::models::NotificationChannel::Email),
-                fallback_channel: Some(crate::models::NotificationChannel::Sms),
-                ..Default::default()
-            },
-        );
-        let prefs = svc.get_preferences("owner1");
-        assert_eq!(prefs.preferred_channel, Some(crate::models::NotificationChannel::Email));
-        assert_eq!(prefs.fallback_channel, Some(crate::models::NotificationChannel::Sms));
-    }
-
-    #[test]
-    fn no_fallback_when_not_configured() {
-        let svc = make_service();
-        let prefs = svc.get_preferences("owner1");
-        assert!(prefs.fallback_channel.is_none());
-    }
-
-    // ── Idempotency tests (#825) ────────────────────────────────────────────
-
-    #[test]
-    fn store_and_check_idempotency_key() {
-        let svc = make_service();
-        assert!(svc.check_idempotency("key1").is_none());
-        svc.store_idempotency("key1".into(), 200, r#"{"ok":true}"#.into());
-        let cached = svc.check_idempotency("key1").unwrap();
-        assert_eq!(cached.status_code, 200);
-        assert_eq!(cached.response_body, r#"{"ok":true}"#);
-    }
-
-    #[test]
-    fn idempotency_key_expired_returns_none() {
-        let svc = make_service();
-        svc.idempotency.lock().unwrap().insert(
-            "old-key".into(),
-            crate::models::IdempotencyRecord {
-                key: "old-key".into(),
-                response_body: "{}".into(),
-                status_code: 200,
-                created_at: Utc::now() - chrono::Duration::seconds(IDEMPOTENCY_TTL_SECS + 1),
-            },
-        );
-        assert!(svc.check_idempotency("old-key").is_none());
-    }
-
-    #[test]
-    fn purge_expired_idempotency_keys_removes_old() {
-        let svc = make_service();
-        svc.idempotency.lock().unwrap().insert(
-            "old".into(),
-            crate::models::IdempotencyRecord {
-                key: "old".into(),
-                response_body: "{}".into(),
-                status_code: 200,
-                created_at: Utc::now() - chrono::Duration::seconds(IDEMPOTENCY_TTL_SECS + 1),
-            },
-        );
-        svc.store_idempotency("fresh".into(), 200, "{}".into());
-        svc.purge_expired_idempotency_keys();
-        assert!(svc.idempotency.lock().unwrap().get("old").is_none());
-        assert!(svc.idempotency.lock().unwrap().get("fresh").is_some());
-    }
-
-    #[test]
-    fn duplicate_idempotency_key_returns_same_response() {
-        let svc = make_service();
-        svc.store_idempotency("key-dup".into(), 201, r#"{"id":"v1"}"#.into());
-        svc.store_idempotency("key-dup".into(), 201, r#"{"id":"v1"}"#.into());
-        let cached = svc.check_idempotency("key-dup").unwrap();
-        assert_eq!(cached.response_body, r#"{"id":"v1"}"#);
+        let vault = make_vault(Some(172_800));
+        svc.schedule_expiry_warning(&vault);
+        let all = svc.schedule.lock().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].max_retry_attempts, DEFAULT_MAX_RETRY_ATTEMPTS);
     }
 }

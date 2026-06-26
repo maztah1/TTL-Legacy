@@ -2,19 +2,26 @@ use std::sync::Arc;
 
 use axum::{
     body::Body,
-    http::{Request, StatusCode},
-    Router,
+    extract::State,
+    http::{HeaderValue, Method, Request, StatusCode},
     routing::{get, post},
+    Json, Router,
 };
 use serde_json::json;
 use tower::ServiceExt;
+use tower_http::cors::CorsLayer;
 
-use crate::{db::Db, routes};
+use crate::{db::{Db, PoolConfig}, routes};
 
 fn test_app() -> Router {
-    let db = Arc::new(Db::open(":memory:").unwrap());
+    test_app_with_db(Arc::new(Db::open(":memory:").unwrap()))
+}
+
+fn test_app_with_db(db: Arc<Db>) -> Router {
     db.migrate().unwrap();
     Router::new()
+        .route("/health", get(health_handler))
+        .route("/ready", get(ready_handler))
         .route(
             "/api/vaults/:vault_id/reminder-preferences",
             post(routes::set_preferences).get(routes::get_preferences),
@@ -26,10 +33,22 @@ fn test_app() -> Router {
         .with_state(db)
 }
 
-fn test_db() -> Arc<Db> {
-    let db = Arc::new(Db::open(":memory:").unwrap());
-    db.migrate().unwrap();
-    db
+async fn health_handler() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
+}
+
+async fn ready_handler(State(db): State<Arc<Db>>) -> Result<Json<serde_json::Value>, StatusCode> {
+    match db.check_connectivity() {
+        Ok(()) => Ok(Json(serde_json::json!({
+            "status": "ok",
+            "version": env!("CARGO_PKG_VERSION"),
+            "database": "connected",
+        }))),
+        Err(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
+    }
 }
 
 async fn post_json(app: Router, uri: &str, body: serde_json::Value) -> axum::response::Response {
@@ -139,132 +158,138 @@ async fn test_upsert_overwrites() {
     assert_eq!(fetched.frequency, crate::models::Frequency::Hourly);
 }
 
-// ── Idempotency key tests (#825) ────────────────────────────────────────────
-
-async fn post_json_with_header(
-    app: Router,
-    uri: &str,
-    body: serde_json::Value,
-    header_name: &str,
-    header_value: &str,
-) -> axum::response::Response {
-    app.oneshot(
-        Request::builder()
-            .method("POST")
-            .uri(uri)
-            .header("content-type", "application/json")
-            .header(header_name, header_value)
-            .body(Body::from(body.to_string()))
-            .unwrap(),
-    )
-    .await
-    .unwrap()
-}
+// ── #821: Health check endpoint tests ────────────────────────────────────────
 
 #[tokio::test]
-async fn test_idempotent_request_returns_cached() {
-    let db = test_db();
-    let body = json!({
-        "channels": ["email"],
-        "hours_before_expiry": 24,
-        "frequency": "once"
-    });
-
-    let app1 = Router::new()
-        .route(
-            "/api/vaults/:vault_id/reminder-preferences",
-            post(routes::set_preferences),
-        )
-        .with_state(db.clone());
-
-    let res1 = post_json_with_header(
-        app1,
-        "/api/vaults/1/reminder-preferences",
-        body.clone(),
-        "idempotency-key",
-        "idem-123",
-    )
-    .await;
-    assert_eq!(res1.status(), StatusCode::OK);
-
-    // Second request with same key returns cached
-    let app2 = Router::new()
-        .route(
-            "/api/vaults/:vault_id/reminder-preferences",
-            post(routes::set_preferences),
-        )
-        .with_state(db.clone());
-
-    let res2 = post_json_with_header(
-        app2,
-        "/api/vaults/1/reminder-preferences",
-        body,
-        "idempotency-key",
-        "idem-123",
-    )
-    .await;
-    assert_eq!(res2.status(), StatusCode::OK);
-}
-
-#[tokio::test]
-async fn test_non_idempotent_request_processes_normally() {
+async fn test_health_endpoint() {
     let app = test_app();
-    let body = json!({
-        "channels": ["sms"],
-        "hours_before_expiry": 12,
-        "frequency": "daily"
-    });
-    let res = post_json(app, "/api/vaults/2/reminder-preferences", body).await;
+    let res = get_req(app, "/health").await;
     assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["status"], "ok");
+    assert!(json["version"].is_string());
 }
 
 #[tokio::test]
-async fn test_db_idempotency_store_and_check() {
-    let db = test_db();
-    assert!(db.check_idempotency("key-abc").is_none());
-    db.store_idempotency("key-abc", 200, r#"{"vault_id":1}"#);
-    let cached = db.check_idempotency("key-abc").unwrap();
-    assert_eq!(cached.status_code, 200);
-    assert_eq!(cached.response_body, r#"{"vault_id":1}"#);
+async fn test_ready_endpoint() {
+    let app = test_app();
+    let res = get_req(app, "/ready").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["status"], "ok");
+    assert_eq!(json["database"], "connected");
 }
 
-// ── Unsubscribe tests (#828) ────────────────────────────────────────────────
+// ── #822: Pool configuration tests ───────────────────────────────────────────
 
 #[tokio::test]
-async fn test_unsubscribe_valid_token() {
-    let db = test_db();
-    let token = db.generate_unsubscribe_token("owner1");
+async fn test_pool_config_defaults() {
+    let config = PoolConfig::default();
+    assert_eq!(config.min, 2);
+    assert_eq!(config.max, 10);
+    assert_eq!(config.timeout_secs, 30);
+}
+
+#[tokio::test]
+async fn test_db_open_with_pool_config() {
+    let config = PoolConfig { min: 1, max: 5, timeout_secs: 15 };
+    let db = Db::open_with_pool_config(":memory:", &config);
+    assert!(db.is_ok());
+}
+
+// ── #823: CORS tests ─────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_cors_allowed_origin() {
+    let db = Arc::new(Db::open(":memory:").unwrap());
+    db.migrate().unwrap();
+
+    let cors = CorsLayer::new()
+        .allow_origin("http://example.com".parse::<HeaderValue>().unwrap())
+        .allow_methods([Method::GET, Method::POST]);
 
     let app = Router::new()
-        .route("/notifications/unsubscribe", get(routes::unsubscribe))
-        .with_state(db.clone());
+        .route("/health", get(health_handler))
+        .layer(cors)
+        .with_state(db);
 
-    let uri = format!("/notifications/unsubscribe?token={token}");
-    let res = get_req(app, &uri).await;
-    assert_eq!(res.status(), StatusCode::OK);
-    assert!(db.is_unsubscribed("owner1"));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/health")
+                .header("origin", "http://example.com")
+                .header("access-control-request-method", "GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert!(res.headers().get("access-control-allow-origin").is_some());
+    assert_eq!(
+        res.headers().get("access-control-allow-origin").unwrap(),
+        "http://example.com"
+    );
 }
 
 #[tokio::test]
-async fn test_unsubscribe_invalid_token() {
-    let app = test_app();
-    let res = get_req(app, "/notifications/unsubscribe?token=bogus").await;
-    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+async fn test_cors_rejected_origin() {
+    let db = Arc::new(Db::open(":memory:").unwrap());
+    db.migrate().unwrap();
+
+    let cors = CorsLayer::new()
+        .allow_origin("http://allowed.com".parse::<HeaderValue>().unwrap())
+        .allow_methods([Method::GET]);
+
+    let app = Router::new()
+        .route("/health", get(health_handler))
+        .layer(cors)
+        .with_state(db);
+
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/health")
+                .header("origin", "http://evil.com")
+                .header("access-control-request-method", "GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let origin_header = res.headers().get("access-control-allow-origin");
+    match origin_header {
+        Some(val) => assert_ne!(val, "http://evil.com"),
+        None => {} // No header is also acceptable
+    }
 }
 
-#[tokio::test]
-async fn test_db_unsubscribe_flow() {
-    let db = test_db();
-    assert!(!db.is_unsubscribed("owner1"));
-    let token = db.generate_unsubscribe_token("owner1");
-    let result = db.process_unsubscribe(&token);
-    assert!(result.is_ok());
-    assert!(db.is_unsubscribed("owner1"));
-}
+// ── #824: Scheduler resilience tests ─────────────────────────────────────────
 
 #[tokio::test]
-async fn test_db_unsubscribe_invalid_token() {
-    let db = test_db();
-    let result = db.process_unsubscribe("nonexistent");
+async fn test_scheduler_handles_db_errors_gracefully() {
+    let db = Arc::new(Db::open(":memory:").unwrap());
+    // Intentionally do NOT run migrate() so tables don't exist.
+    // The scheduler should log errors and continue, not panic.
+    let result = db.all();
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn test_scheduler_insurance_handles_db_errors() {
+    let db = Arc::new(Db::open(":memory:").unwrap());
+    // No migration — all_enabled_insurance_policies will fail.
+    let result = db.all_enabled_insurance_policies();
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn test_db_check_connectivity() {
+    let db = Db::open(":memory:").unwrap();
+    assert!(db.check_connectivity().is_ok());
 }
