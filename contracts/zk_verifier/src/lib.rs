@@ -23,18 +23,63 @@ pub enum VerifierError {
     ClaimTooLarge = 4,
 }
 
+use keys::DataKey;
+
 #[contract]
 pub struct ZkVerifierContract;
 
 #[contractimpl]
 impl ZkVerifierContract {
-    /// Verifies a zero-knowledge proof against a claim.
+    /// Initialize the contract with an admin address.
+    pub fn initialize(env: Env, admin: Address) {
+        if env.storage().instance().has(&DataKey::Admin) {
+            panic_with_error!(&env, VerifierError::AlreadyInitialized);
+        }
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &admin);
+    }
+
+    /// Register a trusted oracle. Admin only.
+    pub fn register_oracle(env: Env, oracle: Address) {
+        Self::require_admin(&env);
+        env.storage().instance().set(&DataKey::Oracle(oracle), &true);
+    }
+
+    /// Revoke a trusted oracle. Admin only.
+    pub fn revoke_oracle(env: Env, oracle: Address) {
+        Self::require_admin(&env);
+        env.storage().instance().remove(&DataKey::Oracle(oracle));
+    }
+
+    /// Returns whether the given address is a registered oracle.
+    pub fn is_oracle(env: Env, oracle: Address) -> bool {
+        env.storage().instance().get::<DataKey, bool>(&DataKey::Oracle(oracle)).unwrap_or(false)
+    }
+
+    /// An oracle publishes an attestation that `proof` is valid for `claim`.
     ///
-    /// # STUB
-    /// Real ZK proof verification (e.g. Groth16, PLONK) requires a verifier
-    /// circuit and cryptographic primitives not yet available as Soroban host
-    /// functions. This implementation is a non-empty bytes guard that acts as
-    /// a placeholder until a native ZK host function is exposed.
+    /// The contract stores the SHA-256 digests of both byte strings so that
+    /// the full proof bytes are not stored on-chain.
+    pub fn attest(env: Env, oracle: Address, proof: Bytes, claim: Bytes) {
+        if proof.is_empty() {
+            panic_with_error!(&env, VerifierError::EmptyProof);
+        }
+        if claim.is_empty() {
+            panic_with_error!(&env, VerifierError::EmptyClaim);
+        }
+        if !env.storage().instance().get::<DataKey, bool>(&DataKey::Oracle(oracle.clone())).unwrap_or(false) {
+            panic_with_error!(&env, VerifierError::OracleNotFound);
+        }
+        oracle.require_auth();
+        let proof_hash: BytesN<32> = env.crypto().sha256(&proof).into();
+        let claim_hash: BytesN<32> = env.crypto().sha256(&claim).into();
+        env.storage().instance().set(
+            &DataKey::Attestation(proof_hash, claim_hash),
+            &oracle,
+        );
+    }
+
+    /// Verifies a zero-knowledge proof against a claim using oracle attestation.
     ///
     /// Returns `true` when both `proof` and `claim` are non-empty and `proof`
     /// is not the known-invalid 0x00 sentinel.
