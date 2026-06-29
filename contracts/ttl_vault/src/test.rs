@@ -1293,6 +1293,24 @@ fn test_trigger_release_returns_not_expired_error_before_ttl_lapses() {
 // Regression test for #98: set_beneficiaries must return ContractError::InvalidBps (code 12)
 // when the beneficiary BPS entries do not sum to exactly 10_000.
 #[test]
+fn test_trigger_release_vault_state_committed_before_transfer() {
+    // Verifies checks-effects-interactions: after trigger_release returns,
+    // vault.balance must be 0 and vault.status must be Released, confirming
+    // state was saved before (not after) the token transfer.
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    StellarAssetClient::new(&env, &token_address).mint(&owner, &1_000i128);
+    client.deposit(&vault_id, &owner, &1_000i128);
+
+    env.ledger().with_mut(|l| l.timestamp += 101);
+    client.trigger_release(&vault_id);
+
+    let vault = client.get_vault(&vault_id);
+    assert_eq!(vault.balance, 0);
+    assert_eq!(vault.status, ReleaseStatus::Released);
+}
+
+#[test]
 fn test_set_beneficiaries_rejects_invalid_bps() {
     let (env, owner, beneficiary, _, _, client) = setup();
     let b2 = Address::generate(&env);

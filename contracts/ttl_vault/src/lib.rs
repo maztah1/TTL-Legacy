@@ -2200,18 +2200,8 @@ impl TtlVaultContract {
             } else {
                 total
             };
-            let token_client = token::Client::new(&env, &vault.token_address);
 
-            if vault.beneficiaries.is_empty() {
-                token_client.transfer(&env.current_contract_address(), &vault.beneficiary, &release_amount);
-                env.events().publish(
-                    (RELEASE_TOPIC,),
-                    ReleaseEvent { vault_id, beneficiary: vault.beneficiary.clone(), amount: release_amount },
-                );
-            } else {
-                Self::distribute_release_amount(&env, vault_id, &vault, release_amount, mode);
-            }
-
+            // Checks-Effects-Interactions: mutate vault state BEFORE external token transfer.
             vault.balance -= release_amount;
             if vault.balance == 0 {
                 vault.status = ReleaseStatus::Released;
@@ -2232,6 +2222,18 @@ impl TtlVaultContract {
                 env.events().publish((VAULT_ARCHIVED_TOPIC, vault_id), (vault_id, ReleaseStatus::Released));
             }
             env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+
+            // Interaction: perform token transfer(s) after all state is committed.
+            let token_client = token::Client::new(&env, &vault.token_address);
+            if vault.beneficiaries.is_empty() {
+                token_client.transfer(&env.current_contract_address(), &vault.beneficiary, &release_amount);
+                env.events().publish(
+                    (RELEASE_TOPIC,),
+                    ReleaseEvent { vault_id, beneficiary: vault.beneficiary.clone(), amount: release_amount },
+                );
+            } else {
+                Self::distribute_release_amount(&env, vault_id, &vault, release_amount, mode);
+            }
         }
     }
 
