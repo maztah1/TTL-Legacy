@@ -238,6 +238,11 @@ pub enum ContractError {
     AuctionEnded = 80,
     AuctionNotEnded = 81,
     InvalidVestingSchedule = 82,
+    // Issue #871: metadata UTF-8 sanitization
+    InvalidMetadataEncoding = 83,
+    // Issue #809: protocol config timelock
+    NoPendingProtocolConfig = 84,
+    ProtocolConfigTimeLocked = 85,
 }
 
 #[contract]
@@ -952,6 +957,7 @@ impl TtlVaultContract {
             max_check_in_interval: env.storage().instance().get(&DataKey::MaxCheckInInterval),
             max_ttl_seconds: env.storage().instance().get(&DataKey::MaxTtlSeconds).unwrap_or(315_360_000),
             ttl_decay_rate: env.storage().instance().get(&DataKey::TtlDecayRate).unwrap_or(0),
+            require_utf8_metadata: env.storage().instance().get(&DataKey::RequireUtf8Metadata).unwrap_or(false),
         }
     }
 
@@ -1017,6 +1023,7 @@ impl TtlVaultContract {
         }
         env.storage().instance().set(&DataKey::MaxTtlSeconds, &config.max_ttl_seconds);
         env.storage().instance().set(&DataKey::TtlDecayRate, &config.ttl_decay_rate);
+        env.storage().instance().set(&DataKey::RequireUtf8Metadata, &config.require_utf8_metadata);
         env.storage().instance().remove(&DataKey::PendingProtocolConfig);
         env.storage().instance().remove(&DataKey::ProtocolConfigProposedAt);
         env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
@@ -5742,6 +5749,7 @@ impl TtlVaultContract {
         if metadata.len() > MAX_CUSTOM_METADATA_LEN {
             return Err(ContractError::InvalidAmount);
         }
+        Self::require_utf8_metadata_bytes(&env, &metadata)?;
         let mut vault = Self::load_vault(&env, vault_id);
         if caller != vault.owner {
             return Err(ContractError::NotOwner);
@@ -6829,6 +6837,24 @@ impl TtlVaultContract {
         if metadata.len() > MAX_METADATA_LEN {
             panic_with_error!(env, ContractError::InvalidAmount);
         }
+    }
+
+    /// Validates that `bytes` are valid UTF-8 when the `RequireUtf8Metadata` flag is set.
+    /// Returns `Err(ContractError::InvalidMetadataEncoding)` on failure.
+    fn require_utf8_metadata_bytes(env: &Env, bytes: &Bytes) -> Result<(), ContractError> {
+        let enforced: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::RequireUtf8Metadata)
+            .unwrap_or(false);
+        if enforced {
+            // Convert to a slice and verify every byte sequence is valid UTF-8.
+            let raw = bytes.to_alloc_vec();
+            if core::str::from_utf8(&raw).is_err() {
+                return Err(ContractError::InvalidMetadataEncoding);
+            }
+        }
+        Ok(())
     }
 
     fn assert_token_whitelisted(env: &Env, token_address: &Address) {
