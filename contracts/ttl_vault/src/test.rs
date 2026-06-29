@@ -3054,6 +3054,38 @@ fn test_security_released_vault_immutable() {
 }
 
 #[test]
+fn test_trigger_release_rejects_second_attempt_after_partial_release() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    StellarAssetClient::new(&env, &token_address).mint(&owner, &1_000_000);
+    client.deposit(&vault_id, &owner, &1_000i128);
+    client.set_spending_limit(&vault_id, &Some(400i128));
+
+    env.ledger().with_mut(|l| l.timestamp += 101);
+    client.trigger_release(&vault_id);
+
+    let err = client.try_trigger_release(&vault_id).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(ContractError::AlreadyReleased as u32));
+    assert_eq!(client.get_vault(&vault_id).balance, 600i128);
+    assert_eq!(client.get_vault(&vault_id).status, ReleaseStatus::Locked);
+}
+
+#[test]
+fn test_withdraw_rejects_destination_equal_to_contract_address() {
+    let (env, _, beneficiary, _, token_address, client) = setup();
+
+    let self_owner = client.address.clone();
+    let vault_id = client.create_vault(&self_owner, &beneficiary, &3600u64, &Some(token_address.clone()));
+    StellarAssetClient::new(&env, &token_address).mint(&self_owner, &100_000i128);
+    client.deposit(&vault_id, &self_owner, &100_000i128);
+
+    let err = client.try_withdraw(&vault_id, &self_owner, &50_000i128).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(ContractError::InvalidWithdrawDestination as u32));
+    assert_eq!(client.get_vault(&vault_id).balance, 100_000i128);
+}
+
+#[test]
 fn test_security_paused_contract_blocks_operations() {
     let (env, owner, beneficiary, admin, token_address, client) = setup();
     
