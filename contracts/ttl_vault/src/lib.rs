@@ -238,6 +238,8 @@ pub enum ContractError {
     AuctionEnded = 80,
     AuctionNotEnded = 81,
     InvalidVestingSchedule = 82,
+    /// Caller is not the vault owner and is not permitted to deposit into this vault.
+    UnauthorizedDepositor = 83,
 }
 
 #[contract]
@@ -1369,6 +1371,9 @@ impl TtlVaultContract {
         }
         from.require_auth();
         let mut vault = Self::load_vault(&env, vault_id);
+        if from != vault.owner {
+            panic_with_error!(&env, ContractError::UnauthorizedDepositor);
+        }
         if vault.is_paused {
             panic_with_error!(&env, ContractError::Paused);
         }
