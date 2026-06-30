@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use axum::{
     body::Body,
-    extract::State,
     http::{HeaderValue, Method, Request, StatusCode},
     middleware,
     routing::{delete, get, post},
@@ -31,7 +30,17 @@ fn test_state(db: Arc<Db>) -> AppState {
 }
 
 fn test_app() -> Router {
-    test_app_with_db(Arc::new(Db::open(":memory:").unwrap()))
+    let db = Arc::new(Db::open(":memory:").unwrap());
+    db.migrate().unwrap();
+    let state = Arc::new(AppState {
+        db: Arc::clone(&db),
+        vault_store: create_vault_store(),
+        event_store: create_event_store(),
+        audit_store: create_audit_store(),
+        share_store: create_share_store(),
+        share_token_store: create_share_token_store(),
+    });
+    build_router(state)
 }
 
 fn test_app_with_db(db: Arc<Db>) -> Router {

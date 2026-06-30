@@ -25,6 +25,7 @@ mod tests;
 
 pub use consensus::NodeCache;
 pub use db::Db;
+pub use db::AppState;
 
 #[derive(Clone)]
 pub struct AppState {
