@@ -78,6 +78,7 @@ use types::{
     BeneficiaryPool, POOL_CREATED_TOPIC,
     ADMIN_TRANSFER_PROPOSED_TOPIC, ADMIN_TRANSFER_COMPLETED_TOPIC,
     PauseRecord,
+    PARTIAL_LIQUIDATE_TOPIC,
 };
 #[cfg(test)]
 mod regression_tests;
@@ -238,6 +239,10 @@ pub enum ContractError {
     AuctionEnded = 80,
     AuctionNotEnded = 81,
     InvalidVestingSchedule = 82,
+    // Vault Partial Liquidation Before Release
+    InvalidPercentage = 83,
+    // Amount exceeds the per-call percentage limit on partial liquidation.
+    LiquidationExceedsLimit = 84,
 }
 
 #[contract]
@@ -1582,6 +1587,126 @@ impl TtlVaultContract {
                 (WITHDRAW_TOPIC, vault_id),
                 (amount, vault.balance),
             );
+            Ok(())
+        }
+
+    // --- Vault Partial Liquidation Before Release ---
+
+    /// Owner-only partial liquidation. Withdraws up to `percentage_allowed`
+    /// percent of the vault's current balance without resetting the TTL countdown.
+    ///
+    /// Use cases:
+    /// - Owner needs immediate liquidity while keeping the vault alive.
+    /// - Owner wants to skim interest / yield before expiry.
+    ///
+    /// The caller passes the per-call ceiling explicitly via `percentage_allowed`
+    /// (1-100, inclusive). The function rejects amounts exceeding that ceiling and
+    /// does NOT touch `last_check_in`, so the existing TTL countdown keeps running.
+    ///
+    /// Multiple calls per vault are permitted; each call is independently bounded
+    /// by the percentage ceiling. `last_check_in` and `status` are preserved, so
+    /// the vault keeps its current time-to-live and stays in `Locked`.
+    ///
+    /// # Arguments
+    /// * `vault_id` - The vault ID to liquidate from.
+    /// * `amount` - The amount to withdraw (must be > 0 and ≤ `percentage_allowed`
+    ///              percent of the vault's current balance).
+    /// * `percentage_allowed` - Per-call cap, as a percentage (1-100, inclusive).
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Errors
+    /// * `ContractError::Paused` - Contract is paused.
+    /// * `ContractError::InvalidAmount` - `amount` is not positive.
+    /// * `ContractError::InvalidPercentage` - `percentage_allowed` is 0 or > 100.
+    /// * `ContractError::LiquidationExceedsLimit` - `amount` exceeds allowed percentage.
+    /// * `ContractError::InsufficientBalance` - vault cannot cover `amount`.
+    /// * `ContractError::NotOwner` - caller is not the vault owner.
+    /// * `ContractError::AlreadyReleased` - vault is not in Locked status.
+    /// * `ContractError::VaultFrozen` - vault is in EmergencyFrozen status.
+    pub fn partial_liquidate(
+            env: Env,
+            vault_id: u64,
+            amount: i128,
+            percentage_allowed: u32,
+        ) -> Result<(), ContractError> {
+            if Self::load_paused(&env) {
+                return Err(ContractError::Paused);
+            }
+            if amount <= 0 {
+                return Err(ContractError::InvalidAmount);
+            }
+            if percentage_allowed == 0 || percentage_allowed > 100 {
+                return Err(ContractError::InvalidPercentage);
+            }
+
+            let mut vault = Self::load_vault(&env, vault_id);
+            if vault.is_paused {
+                return Err(ContractError::Paused);
+            }
+            vault.owner.require_auth();
+
+            if vault.status == ReleaseStatus::EmergencyFrozen {
+                return Err(ContractError::VaultFrozen);
+            }
+            if vault.status != ReleaseStatus::Locked {
+                return Err(ContractError::AlreadyReleased);
+            }
+
+            // Capture TTL remaining BEFORE any state mutation so the emitted
+            // event accurately reflects the countdown at the time of liquidation.
+            let ttl_remaining_before = Self::get_ttl_remaining(env.clone(), vault_id).unwrap_or(0);
+
+            // Enforce the per-call percentage cap on the current vault balance.
+            // Use checked arithmetic to guard against i128 overflow.
+            // (Stellar asset balances are well below i128::MAX / 100 in practice,
+            // but we conservatively reject on overflow rather than silently
+            // substituting `i128::MAX`.)
+            let max_allowed = vault
+                .balance
+                .checked_mul(percentage_allowed as i128)
+                .and_then(|v| v.checked_div(100));
+            let max_allowed = match max_allowed {
+                Some(v) => v,
+                None => return Err(ContractError::LiquidationExceedsLimit),
+            };
+            if amount > max_allowed {
+                return Err(ContractError::LiquidationExceedsLimit);
+            }
+            if amount > vault.balance {
+                return Err(ContractError::InsufficientBalance);
+            }
+
+            // Transfer tokens to the owner.
+            let token_client = token::Client::new(&env, &vault.token_address);
+            token_client.transfer(&env.current_contract_address(), &vault.owner, &amount);
+            vault.balance -= amount;
+
+            // CRITICAL: Do NOT touch vault.last_check_in here. The TTL countdown
+            // keeps running so a partial liquidation does not reset the expiry.
+            Self::save_vault(&env, vault_id, &vault);
+
+            Self::log_audit_entry(
+                &env,
+                vault_id,
+                "partial_liquidate",
+                &vault.owner,
+                "partial_liquidation",
+            );
+            Self::append_activity_log(
+                &env,
+                vault_id,
+                "partial_liquidate",
+                &vault.owner,
+                "partial_liquidation",
+            );
+
+            env.events().publish(
+                (PARTIAL_LIQUIDATE_TOPIC, vault_id),
+                (vault_id, amount, ttl_remaining_before),
+            );
+            env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
             Ok(())
         }
 
