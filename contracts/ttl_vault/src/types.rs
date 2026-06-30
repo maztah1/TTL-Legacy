@@ -387,6 +387,7 @@ pub enum DataKey {
     BeneficiaryStatusEntry(u64, Address),
     // Issue: beneficiary veto of owner-defined release conditions before expiry
     BeneficiaryReleaseConditionVeto(u64),
+    ReleaseConditions(u64),
     // Hibernation: temporary suspension of check-in requirement
     Hibernation(u64),
     LastCheckInTime(u64),
@@ -557,9 +558,9 @@ pub enum ReleaseStatus {
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub enum ReleaseCondition {
-    OnExpiry,
-    OnProof(u32),
-    Tranche(Vec<(u64, u32)>),
+    TTLExpiry,
+    OwnerInitiated,
+    Oracle(Address),
 }
 
 #[contracttype]
