@@ -8,9 +8,10 @@ use axum::{
 use serde::Deserialize;
 
 use crate::{
+    audit,
     db::Db,
-    error::AppError,
-    models::{ReminderPreferences, SetPreferencesRequest},
+    error::{ApiError, AppError},
+    models::{AuditLogEntry, AuditLogQuery, ReminderPreferences, SetPreferencesRequest},
 };
 
 #[derive(Deserialize)]
@@ -114,5 +115,63 @@ pub async fn unsubscribe(
             "Invalid or expired unsubscribe token".into(),
         )),
     }
+}
+
+// ── Audit Log endpoint (#961) ──────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct AuditLogParams {
+    pub user_id: Option<String>,
+    pub action: Option<String>,
+    pub resource: Option<String>,
+    pub result: Option<String>,
+    pub after: Option<String>,
+    pub before: Option<String>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+/// GET /api/audit-logs
+///
+/// Returns audit log entries with optional filtering.
+/// Requires `Authorization: Bearer <ADMIN_API_KEY>`.
+pub async fn get_audit_logs(
+    State(db): State<Arc<Db>>,
+    headers: HeaderMap,
+    Query(params): Query<AuditLogParams>,
+) -> Result<Json<Vec<AuditLogEntry>>, ApiError> {
+    audit::authorize_admin(&headers)?;
+
+    let after = params
+        .after
+        .as_ref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc));
+    let before = params
+        .before
+        .as_ref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc));
+
+    let query = AuditLogQuery {
+        user_id: params.user_id,
+        action: params.action,
+        resource: params.resource,
+        result: params.result,
+        after,
+        before,
+        limit: params.limit,
+        offset: params.offset,
+    };
+
+    let entries = db.query_audit_logs(&query).map_err(|e| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            format!("failed to query audit logs: {e}"),
+        )
+    })?;
+
+    Ok(Json(entries))
 }
 

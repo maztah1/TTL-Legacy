@@ -128,6 +128,9 @@ pub struct NotificationPreferences {
     /// Hours before expiry to send the warning (default 24).
     pub warning_hours_before: u64,
     pub locale: Option<Locale>,
+    pub preferred_channel: Option<NotificationChannel>,
+    pub fallback_channel: Option<NotificationChannel>,
+    pub unsubscribed: bool,
 }
 
 impl Default for NotificationPreferences {
@@ -139,6 +142,9 @@ impl Default for NotificationPreferences {
             vault_released_enabled: true,
             warning_hours_before: 24,
             locale: None,
+            preferred_channel: None,
+            fallback_channel: None,
+            unsubscribed: false,
         }
     }
 }
@@ -176,6 +182,7 @@ pub struct ScheduledNotification {
     pub scheduled_at: DateTime<Utc>,
     pub status: DeliveryStatus,
     pub max_retry_attempts: u32,
+    pub sent_at: Option<DateTime<Utc>>,
 }
 
 /// Delivery record written after each send attempt.
@@ -490,5 +497,31 @@ pub struct IdempotencyRecord {
     pub response_body: String,
     pub status_code: u16,
     pub created_at: DateTime<Utc>,
+}
+
+// ── Audit Log persistence (#961) ────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditLogEntry {
+    pub id: i64,
+    pub timestamp: DateTime<Utc>,
+    pub user_id: String,
+    pub action: String,
+    pub resource: String,
+    pub result: String,
+    pub ip_address: String,
+    pub details: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct AuditLogQuery {
+    pub user_id: Option<String>,
+    pub action: Option<String>,
+    pub resource: Option<String>,
+    pub result: Option<String>,
+    pub after: Option<DateTime<Utc>>,
+    pub before: Option<DateTime<Utc>>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
 }
 

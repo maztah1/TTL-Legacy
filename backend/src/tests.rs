@@ -4,6 +4,7 @@ use axum::{
     body::Body,
     extract::State,
     http::{HeaderValue, Method, Request, StatusCode},
+    middleware,
     routing::{delete, get, post},
     Json, Router,
 };
@@ -11,7 +12,7 @@ use serde_json::json;
 use tower::ServiceExt;
 use tower_http::cors::CorsLayer;
 
-use crate::{db::{Db, PoolConfig}, routes};
+use crate::{audit, db::{Db, PoolConfig}, routes};
 
 fn test_app() -> Router {
     test_app_with_db(Arc::new(Db::open(":memory:").unwrap()))
@@ -36,6 +37,11 @@ fn test_app_with_db(db: Arc<Db>) -> Router {
             "/notifications/unsubscribe",
             get(routes::unsubscribe),
         )
+        .route("/api/audit-logs", get(routes::get_audit_logs))
+        .layer(middleware::from_fn_with_state(
+            db.clone(),
+            audit::audit_middleware,
+        ))
         .with_state(db)
 }
 
@@ -436,4 +442,181 @@ mod notification_delivery_tests {
         assert!(!log.is_empty());
         assert_eq!(log[0].status, DeliveryStatus::Sent);
     }
+}
+
+// ── #961: Audit Log persistence tests ─────────────────────────────────────────
+
+#[tokio::test]
+async fn test_audit_middleware_logs_api_calls() {
+    let db = Arc::new(Db::open(":memory:").unwrap());
+    let app = test_app_with_db(Arc::clone(&db));
+
+    let res = get_req(app, "/api/vaults/1/reminder-preferences").await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+    let query = crate::models::AuditLogQuery::default();
+    let logs = db.query_audit_logs(&query).unwrap();
+    assert!(!logs.is_empty(), "audit log should have at least one entry");
+
+    let log = &logs[0];
+    assert_eq!(log.action, "GET");
+    assert_eq!(log.resource, "/api/vaults/1/reminder-preferences");
+    assert_eq!(log.result, "failure");
+}
+
+#[tokio::test]
+async fn test_audit_log_does_not_log_health_endpoint() {
+    let db = Arc::new(Db::open(":memory:").unwrap());
+    let app = test_app_with_db(Arc::clone(&db));
+
+    let _ = get_req(app, "/health").await;
+
+    let query = crate::models::AuditLogQuery::default();
+    let logs = db.query_audit_logs(&query).unwrap();
+    assert!(
+        logs.iter().all(|l| l.resource != "/health"),
+        "health endpoint should not appear in audit logs"
+    );
+}
+
+#[tokio::test]
+async fn test_audit_log_does_not_log_audit_logs_endpoint() {
+    let db = Arc::new(Db::open(":memory:").unwrap());
+    let app = test_app_with_db(Arc::clone(&db));
+
+    std::env::set_var("ADMIN_API_KEY", "");
+    let _ = get_req(app, "/api/audit-logs").await;
+
+    let query = crate::models::AuditLogQuery::default();
+    let logs = db.query_audit_logs(&query).unwrap();
+    assert!(
+        logs.iter().all(|l| l.resource != "/api/audit-logs"),
+        "audit-logs endpoint should not appear in its own logs"
+    );
+}
+
+#[tokio::test]
+async fn test_audit_logs_endpoint_requires_admin_key() {
+    let db = Arc::new(Db::open(":memory:").unwrap());
+    db.migrate().unwrap();
+
+    let app: Router = Router::new()
+        .route("/api/audit-logs", get(routes::get_audit_logs))
+        .with_state(Arc::clone(&db));
+
+    std::env::set_var("ADMIN_API_KEY", "test-admin-key");
+
+    let res = get_req(app, "/api/audit-logs").await;
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    std::env::remove_var("ADMIN_API_KEY");
+}
+
+#[tokio::test]
+async fn test_audit_logs_endpoint_with_valid_key() {
+    let db = Arc::new(Db::open(":memory:").unwrap());
+    db.migrate().unwrap();
+
+    let entry = crate::models::AuditLogEntry {
+        id: 0,
+        timestamp: chrono::Utc::now(),
+        user_id: "test-user".to_string(),
+        action: "GET".to_string(),
+        resource: "/api/test".to_string(),
+        result: "success".to_string(),
+        ip_address: "127.0.0.1".to_string(),
+        details: None,
+    };
+    db.insert_audit_log(&entry).unwrap();
+
+    let app: Router = Router::new()
+        .route("/api/audit-logs", get(routes::get_audit_logs))
+        .with_state(Arc::clone(&db));
+
+    std::env::set_var("ADMIN_API_KEY", "test-admin-key");
+
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/audit-logs")
+                .header("authorization", "Bearer test-admin-key")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let logs: Vec<crate::models::AuditLogEntry> = serde_json::from_slice(&body).unwrap();
+    assert!(!logs.is_empty());
+    assert_eq!(logs[0].action, "GET");
+    assert_eq!(logs[0].resource, "/api/test");
+
+    std::env::remove_var("ADMIN_API_KEY");
+}
+
+#[tokio::test]
+async fn test_audit_log_endpoint_filtering() {
+    let db = Arc::new(Db::open(":memory:").unwrap());
+    db.migrate().unwrap();
+
+    for action in &["GET", "POST", "DELETE"] {
+        let entry = crate::models::AuditLogEntry {
+            id: 0,
+            timestamp: chrono::Utc::now(),
+            user_id: "user1".to_string(),
+            action: action.to_string(),
+            resource: "/api/test".to_string(),
+            result: "success".to_string(),
+            ip_address: "127.0.0.1".to_string(),
+            details: None,
+        };
+        db.insert_audit_log(&entry).unwrap();
+    }
+
+    let query = crate::models::AuditLogQuery {
+        action: Some("POST".to_string()),
+        ..Default::default()
+    };
+    let logs = db.query_audit_logs(&query).unwrap();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].action, "POST");
+}
+
+#[tokio::test]
+async fn test_audit_log_purge_old_entries() {
+    let db = Arc::new(Db::open(":memory:").unwrap());
+    db.migrate().unwrap();
+
+    let old_entry = crate::models::AuditLogEntry {
+        id: 0,
+        timestamp: chrono::Utc::now() - chrono::Duration::days(100),
+        user_id: "old-user".to_string(),
+        action: "GET".to_string(),
+        resource: "/api/old".to_string(),
+        result: "success".to_string(),
+        ip_address: "127.0.0.1".to_string(),
+        details: None,
+    };
+    db.insert_audit_log(&old_entry).unwrap();
+
+    let recent_entry = crate::models::AuditLogEntry {
+        id: 0,
+        timestamp: chrono::Utc::now(),
+        user_id: "recent-user".to_string(),
+        action: "POST".to_string(),
+        resource: "/api/recent".to_string(),
+        result: "success".to_string(),
+        ip_address: "127.0.0.1".to_string(),
+        details: None,
+    };
+    db.insert_audit_log(&recent_entry).unwrap();
+
+    let purged = db.purge_old_audit_logs(90).unwrap();
+    assert_eq!(purged, 1, "should have purged exactly 1 old entry");
+
+    let remaining = db.query_audit_logs(&crate::models::AuditLogQuery::default()).unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].user_id, "recent-user");
 }

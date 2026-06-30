@@ -1,17 +1,21 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     extract::State,
     http::{HeaderValue, Method},
+    middleware,
     routing::{delete, get, post},
     Json, Router,
 };
 use tower_http::cors::CorsLayer;
 use tracing_subscriber::EnvFilter;
 
+mod audit;
 mod db;
 mod error;
 mod models;
+mod notifications;
 mod routes;
 mod scheduler;
 
@@ -83,6 +87,27 @@ async fn main() {
         scheduler::run(scheduler_db).await;
     });
 
+    // Audit log retention scheduler
+    let retention_db = Arc::clone(&db);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(3600));
+        loop {
+            interval.tick().await;
+            let retention_days = std::env::var("AUDIT_LOG_RETENTION_DAYS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(90);
+            match retention_db.purge_old_audit_logs(retention_days) {
+                Ok(count) => {
+                    if count > 0 {
+                        tracing::info!(purged = count, "audit log retention cleanup");
+                    }
+                }
+                Err(e) => tracing::error!(error = %e, "audit log retention cleanup failed"),
+            }
+        }
+    });
+
     let app = Router::new()
         .route("/health", get(health_handler))
         .route("/ready", get(ready_handler))
@@ -96,6 +121,15 @@ async fn main() {
             "/api/vaults/:vault_id/reminders",
             get(routes::list_vault_reminders),
         )
+        .route(
+            "/notifications/unsubscribe",
+            get(routes::unsubscribe),
+        )
+        .route("/api/audit-logs", get(routes::get_audit_logs))
+        .layer(middleware::from_fn_with_state(
+            db.clone(),
+            audit::audit_middleware,
+        ))
         .layer(build_cors_layer())
         .with_state(db);
 
