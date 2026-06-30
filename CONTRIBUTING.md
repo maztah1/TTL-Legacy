@@ -29,37 +29,48 @@ Types: `feat`, `fix`, `test`, `docs`, `refactor`
 - Lint: `cargo clippy --package ttl-vault -- -D warnings`
 - Audit: `cargo audit`
 
-## Debugging in VS Code
+## Clippy Lint Policy
 
-We have pre-configured VS Code debugging settings in the repository to make it easy to run and debug tests in smart contracts and the backend without manual configuration.
+We use a shared Clippy configuration so lint rules apply consistently across all
+workspace crates and match CI.
 
-### Prerequisites
+### Running Clippy Locally
 
-1. Install the following extensions in VS Code:
-   - **rust-analyzer** (by `rust-lang`)
-   - **CodeLLDB** (by `Vadim Chugunov` / `vadimcn.vscode-lldb`)
-2. Ensure your build profile allows debugging symbols (default for development profiles).
+```bash
+# Primary contract (same as CI)
+cargo clippy --package ttl-vault -- -D warnings
 
-### Debugging with CodeLens (Recommended)
+# Any other workspace crate
+cargo clippy --package zk-verifier -- -D warnings
+cargo clippy --package ttl-legacy-backend -- -D warnings
+```
 
-1. Open any Rust test file (e.g., [test.rs](file:///c:/Users/opulencechuks/TTL-Legacy/contracts/ttl_vault/src/test.rs) or [tests.rs](file:///c:/Users/opulencechuks/TTL-Legacy/backend/src/tests.rs)).
-2. You will see a small **Run** and **Debug** button (CodeLens) above each `#[test]` function attribute.
-3. Click **Debug** to build and launch the debugger. The workspace settings are pre-configured to use **CodeLLDB** automatically.
-4. Set breakpoints by clicking in the left margin next to the line number in your contract or backend code.
+The `-D warnings` flag promotes all warnings (including `clippy::pedantic`) to
+errors, matching CI behavior.
 
-### Debugging with VS Code Run & Debug Panel
+### Configuration Files
 
-For more control, you can use the pre-configured profiles in the VS Code **Run & Debug** panel (accessible via `Ctrl+Shift+D` or by clicking the Play icon with the bug symbol in the activity bar):
+| File | Purpose |
+|------|---------|
+| `.clippy.toml` | Clippy thresholds (complexity, argument counts, etc.) |
+| `Cargo.toml` `[workspace.lints.clippy]` | Lint levels, including `clippy::pedantic` and selective allows |
 
-1. **Debug Specific Test (Prompt)**: Prompts you for a test name substring (e.g., `test_search_vaults_by_owner`), compiles the workspace, and runs matching tests under the debugger.
-2. **Debug 'ttl-vault' Library Tests**: Debugs unit tests inside the `ttl-vault` library.
-3. **Debug 'ttl-vault' Integration Tests**: Debugs tests in [integration_tests.rs](file:///c:/Users/opulencechuks/TTL-Legacy/contracts/ttl_vault/tests/integration_tests.rs).
-4. **Debug 'ttl-vault' Property Tests**: Debugs tests in [property_tests.rs](file:///c:/Users/opulencechuks/TTL-Legacy/contracts/ttl_vault/tests/property_tests.rs).
-5. **Debug 'zk-verifier' Library Tests**: Debugs unit tests inside the `zk-verifier` library.
-6. **Debug 'ttl-legacy-backend' Library Tests**: Debugs unit tests inside the `ttl-legacy-backend` library.
-7. **Debug All Workspace Tests**: Runs the entire test suite under the debugger.
+Every workspace member opts in via `[lints] workspace = true` in its `Cargo.toml`.
 
-All debug configurations automatically pass `--nocapture` to cargo test so that standard output (`println!`, logs, etc.) is visible in the Debug Console.
+### Pedantic Lints
+
+The workspace enables `clippy::pedantic` at the warn level. Pedantic lints catch
+style and correctness issues beyond Clippy defaults. A set of **selective allows**
+in the root `Cargo.toml` documents accepted patterns for Soroban contracts (for
+example integer casts in ledger math, large contract APIs, and test helpers).
+
+To propose a new allow, add it to `[workspace.lints.clippy]` with a brief comment
+and explain the accepted pattern in your PR.
+
+### CI Integration
+
+CI runs `cargo clippy --package ttl-vault -- -D warnings` on every PR. Builds fail
+if any Clippy warning remains after the shared configuration is applied.
 
 ## Security Audit Process
 
@@ -107,9 +118,33 @@ The CI pipeline runs `cargo audit` on every PR. Builds will fail if:
 - Any CRITICAL or HIGH severity vulnerabilities are detected
 - Accepted advisories lack proper justification
 
+### Secret Scanning
+
+We use Gitleaks in CI to prevent secrets from being committed in repository files or PR diffs.
+
+- The workflow scans the repository on every push and pull request.
+- Pull requests are scanned against the configured Gitleaks ruleset in `.gitleaks.toml`.
+- Local developers can run the same check before pushing:
+
+```bash
+# Install gitleaks if needed
+brew install gitleaks
+# or: go install github.com/gitleaks/gitleaks/v8@latest
+
+# Scan the repository
+gitleaks detect --source . --config .gitleaks.toml --redact
+```
+
+If a false positive is encountered, add a narrow allowlist entry to `.gitleaks.toml` with a clear justification.
 
 
-## License
 
-Contributions are licensed under MIT License.
+## Versioning Policy
+
+We follow these versioning standards:
+
+- **Contract ABI**: Semantic Versioning (SemVer)
+- **Releases**: Calendar Versioning (CalVer)
+
+All contract versions must be documented in `CHANGELOG.md`.
 
