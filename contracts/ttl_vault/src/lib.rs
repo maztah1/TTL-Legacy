@@ -122,6 +122,11 @@ const MAX_ACCELERATE_SECONDS: u64 = 2_592_000;
 /// Time-lock delay for admin transfers in seconds (24 hours) — Issue #813.
 const ADMIN_TRANSFER_TIMELOCK: u64 = 86_400;
 
+/// Maximum number of beneficiaries allowed per vault — Issue #872.
+/// Derived from benchmark data: 20 beneficiaries stays safely below the 100M
+/// Soroban instruction limit; 50 approaches it. Capped at 20 for headroom.
+pub const MAX_BENEFICIARIES: u32 = 20;
+
 /// Compute a persistent storage TTL (in ledgers) for a vault with the given
 /// check-in interval. Applies a 2× safety buffer so storage outlives the
 /// interval, capped at the Soroban maximum.
