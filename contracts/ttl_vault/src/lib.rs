@@ -2608,6 +2608,7 @@ impl TtlVaultContract {
                 Self::distribute_release_amount(&env, vault_id, &vault, release_amount, mode);
             }
 
+            // Checks-Effects-Interactions: mutate vault state BEFORE external token transfer.
             vault.balance -= release_amount;
             if vault.balance == 0 {
                 vault.status = ReleaseStatus::Released;
