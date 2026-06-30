@@ -2451,6 +2451,17 @@ impl TtlVaultContract {
             panic_with_error!(&env, ContractError::NotExpired);
         }
 
+        let now = env.ledger().timestamp();
+        let mut hibernated = 0u64;
+        if let Some(h) = env.storage().persistent().get::<DataKey, HibernationEntry>(&DataKey::Hibernation(vault_id)) {
+            hibernated = now.saturating_sub(h.started_at).min(h.duration_seconds);
+        }
+        let expiry_time = vault.last_check_in + vault.check_in_interval + hibernated;
+        let grace_period = env.storage().instance().get::<DataKey, u64>(&DataKey::ReleaseGracePeriodSeconds).unwrap_or(0);
+        if now < expiry_time + grace_period {
+            panic_with_error!(&env, ContractError::GracePeriodActive);
+        }
+
         // Beneficiary veto of owner-defined release conditions (Issue: beneficiary veto before expiry).
         // The veto is only meaningful before expiry; since `trigger_release*` requires expiry,
         // veto has already expired in practice. However, for completeness (and for manual release),

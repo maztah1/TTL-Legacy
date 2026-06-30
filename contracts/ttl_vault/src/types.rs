@@ -351,6 +351,7 @@ pub enum DataKey {
     ArchivedVault(u64),
     MaxTtlSeconds,
     TtlDecayRate,
+    ReleaseGracePeriodSeconds,
     BridgeConfig(u32),
     TokenConversion(u64),
     TokenStaking(u64),
