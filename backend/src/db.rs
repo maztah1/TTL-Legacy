@@ -830,3 +830,66 @@ mod tests {
         assert_eq!(result.page, 2);
     }
 }
+
+// ── Cache-aware vault accessors ───────────────────────────────────────────────
+
+use crate::cache::VaultCache;
+use crate::models::VaultSummary;
+
+/// Retrieve a `Vault` from the in-memory store, consulting the cache first.
+///
+/// On a cache miss the vault is fetched from `store`, inserted into the cache
+/// and then returned. Returns `None` if the vault does not exist in the store.
+pub fn get_vault_cached(
+    store: &VaultStore,
+    cache: &VaultCache,
+    vault_id: &str,
+) -> Option<crate::models::Vault> {
+    if let Some(v) = cache.get_vault(vault_id) {
+        return Some(v);
+    }
+    let vault = store.lock().unwrap().get(vault_id).cloned()?;
+    cache.set_vault(vault_id, vault.clone());
+    Some(vault)
+}
+
+/// Retrieve the TTL-remaining value for a vault, consulting the cache first.
+///
+/// Returns `None` if the vault does not exist in the store.
+pub fn get_ttl_remaining_cached(
+    store: &VaultStore,
+    cache: &VaultCache,
+    vault_id: &str,
+) -> Option<Option<u64>> {
+    if let Some(ttl) = cache.get_ttl_remaining(vault_id) {
+        return Some(ttl);
+    }
+    let vault = store.lock().unwrap().get(vault_id).cloned()?;
+    let ttl = vault.ttl_remaining;
+    cache.set_ttl_remaining(vault_id, ttl);
+    Some(ttl)
+}
+
+/// Retrieve a lightweight `VaultSummary` for a vault, consulting the cache
+/// first.
+///
+/// Returns `None` if the vault does not exist in the store.
+pub fn get_vault_summary_cached(
+    store: &VaultStore,
+    cache: &VaultCache,
+    vault_id: &str,
+) -> Option<VaultSummary> {
+    if let Some(s) = cache.get_vault_summary(vault_id) {
+        return Some(s);
+    }
+    let vault = store.lock().unwrap().get(vault_id).cloned()?;
+    let summary = VaultSummary::from(&vault);
+    cache.set_vault_summary(vault_id, summary.clone());
+    Some(summary)
+}
+
+/// Invalidate all cached entries for `vault_id`.  Must be called whenever
+/// a check-in or state-change event modifies vault state.
+pub fn invalidate_vault_cache(cache: &VaultCache, vault_id: &str) {
+    cache.invalidate(vault_id);
+}

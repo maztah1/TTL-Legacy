@@ -492,3 +492,35 @@ pub struct IdempotencyRecord {
     pub created_at: DateTime<Utc>,
 }
 
+// ── Cache layer models ───────────────────────────────────────────────────────
+
+/// Lightweight read-projection of a Vault, cached separately from the full
+/// `Vault` struct to reduce allocation when only summary data is needed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultSummary {
+    pub vault_id: String,
+    pub owner: String,
+    pub status: VaultStatus,
+    pub ttl_remaining: Option<u64>,
+    pub balance: i128,
+}
+
+impl From<&Vault> for VaultSummary {
+    fn from(v: &Vault) -> Self {
+        Self {
+            vault_id: v.id.clone(),
+            owner: v.owner.clone(),
+            status: v.status.clone(),
+            ttl_remaining: v.ttl_remaining,
+            balance: v.balance,
+        }
+    }
+}
+
+/// Response body returned by `POST /api/cache/invalidate/{vault_id}`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CacheInvalidateResponse {
+    pub vault_id: String,
+    pub invalidated: bool,
+}
+
