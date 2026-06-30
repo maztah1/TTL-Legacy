@@ -10,7 +10,7 @@ use serde::Deserialize;
 use crate::{
     db::Db,
     error::AppError,
-    models::{ReminderPreferences, SetPreferencesRequest},
+    models::{ReminderPreferences, SetPreferencesRequest, Subscription, SetSubscriptionRequest},
 };
 
 #[derive(Deserialize)]
@@ -115,4 +115,35 @@ pub async fn unsubscribe(
         )),
     }
 }
+
+// ── Vault Notification Subscription Handlers ────────────────────────────────
+
+pub async fn set_subscription(
+    State(db): State<Arc<Db>>,
+    Path(vault_id): Path<u64>,
+    Json(body): Json<SetSubscriptionRequest>,
+) -> Result<(StatusCode, Json<Subscription>), AppError> {
+    if body.channels.is_empty() {
+        return Err(AppError::InvalidInput("channels must not be empty".into()));
+    }
+
+    let sub = Subscription {
+        vault_id,
+        owner: body.owner,
+        channels: body.channels,
+        frequency: body.frequency,
+    };
+    db.upsert_subscription(&sub)?;
+
+    Ok((StatusCode::OK, Json(sub)))
+}
+
+pub async fn delete_subscription(
+    State(db): State<Arc<Db>>,
+    Path(vault_id): Path<u64>,
+) -> Result<StatusCode, AppError> {
+    db.delete_subscription(vault_id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 
