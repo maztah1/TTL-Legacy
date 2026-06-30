@@ -77,7 +77,12 @@ The CI pipeline runs `cargo audit` on every PR. Builds will fail if:
 
 
 
-## License
+## Versioning Policy
 
-Contributions are licensed under MIT License.
+We follow these versioning standards:
+
+- **Contract ABI**: Semantic Versioning (SemVer)
+- **Releases**: Calendar Versioning (CalVer)
+
+All contract versions must be documented in `CHANGELOG.md`.
 
