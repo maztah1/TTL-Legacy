@@ -18,6 +18,7 @@ mod models;
 mod notifications;
 mod routes;
 mod scheduler;
+mod two_factor;
 
 #[cfg(test)]
 mod tests;

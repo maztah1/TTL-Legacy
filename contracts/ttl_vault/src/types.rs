@@ -441,6 +441,9 @@ pub enum DataKey {
     RequireUtf8Metadata,
     // Issue #796: open proposals tracking
     OpenProposals(u64),
+    // Issue #965: two-factor authentication
+    TwoFactorConfig(u64),
+    TwoFactorVerified(u64),
 }
 
 /// Check-in history entry for TTL prediction - Issue #482
@@ -655,6 +658,15 @@ pub struct PasskeyHash {
 pub struct BackupCode {
     pub code: String,
     pub used: bool,
+}
+
+/// Two-factor authentication configuration - Issue #965
+#[contracttype]
+#[derive(Clone)]
+pub struct TwoFactorConfigData {
+    pub enabled: bool,
+    /// 0 = TOTP, 1 = SMS, 2 = Email
+    pub method: u32,
 }
 
 /// Withdrawal approval request - Issue #404

@@ -13321,4 +13321,91 @@ impl TtlVaultContract {
             .persistent()
             .get(&DataKey::BeneficiaryPool(pool_id))
     }
+
+    // ── Issue #965: Two-Factor Authentication ────────────────────────────────
+
+    /// Enable 2FA for a vault with the given auth method.
+    pub fn enable_2fa(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        method: u32,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        let config = TwoFactorConfigData {
+            enabled: true,
+            method,
+        };
+        env.storage().persistent().set(&DataKey::TwoFactorConfig(vault_id), &config);
+        env.storage().persistent().extend_ttl(&DataKey::TwoFactorConfig(vault_id), VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
+        env.events().publish((TWO_FACTOR_ENABLED_TOPIC, vault_id), (method,));
+        Ok(())
+    }
+
+    /// Disable 2FA for a vault.
+    pub fn disable_2fa(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        env.storage().persistent().remove(&DataKey::TwoFactorConfig(vault_id));
+        env.storage().persistent().remove(&DataKey::TwoFactorVerified(vault_id));
+        env.events().publish((TWO_FACTOR_DISABLED_TOPIC, vault_id), ());
+        Ok(())
+    }
+
+    /// Mark 2FA as verified for this vault (called by backend after OTP validation).
+    /// Requires owner auth. The verification expires after 1 hour.
+    pub fn confirm_2fa(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if !Self::is_2fa_enabled(&env, vault_id) {
+            return Err(ContractError::TwoFactorNotEnabled);
+        }
+        let now = env.ledger().timestamp();
+        env.storage().persistent().set(&DataKey::TwoFactorVerified(vault_id), &now);
+        env.storage().persistent().extend_ttl(&DataKey::TwoFactorVerified(vault_id), VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
+        env.events().publish((TWO_FACTOR_VERIFIED_TOPIC, vault_id), (now,));
+        Ok(())
+    }
+
+    /// Check if 2FA is enabled for a vault (public view function).
+    pub fn is_2fa_enabled(env: &Env, vault_id: u64) -> bool {
+        env.storage()
+            .persistent()
+            .get::<DataKey, TwoFactorConfigData>(&DataKey::TwoFactorConfig(vault_id))
+            .map(|c| c.enabled)
+            .unwrap_or(false)
+    }
+
+    /// Check if 2FA has been verified within the last hour (public view function).
+    pub fn is_2fa_verified(env: &Env, vault_id: u64) -> bool {
+        let verified_at = env.storage()
+            .persistent()
+            .get::<DataKey, u64>(&DataKey::TwoFactorVerified(vault_id));
+        match verified_at {
+            Some(ts) => {
+                let now = env.ledger().timestamp();
+                let one_hour: u64 = 3600;
+                now <= ts + one_hour
+            }
+            None => false,
+        }
+    }
 }
