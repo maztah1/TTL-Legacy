@@ -1,7 +1,7 @@
 use crate::models::{
     Vault, VaultEvent, AuditEntry, SearchQuery, SearchResult, VaultStatus,
     VaultBackup, VaultShare, VaultNotificationPreferences,
-    ReminderPreferences, Channel, Frequency,
+    ReminderPreferences, Channel, Frequency, TwoFactorConfig, TwoFactorMethod,
 };
 
 use chrono::Utc;
@@ -530,6 +530,21 @@ impl Db {
                 "2",
                 "ALTER TABLE reminder_preferences ADD COLUMN deleted_at TEXT;",
             ),
+            (
+                "3",
+                r#"
+                CREATE TABLE IF NOT EXISTS two_factor_config (
+                    vault_id     TEXT PRIMARY KEY,
+                    method       TEXT NOT NULL,
+                    enabled      INTEGER NOT NULL DEFAULT 0,
+                    secret       TEXT,
+                    phone        TEXT,
+                    email        TEXT,
+                    created_at   TEXT NOT NULL,
+                    verified_at  TEXT
+                );
+                "#,
+            ),
         ];
 
         for (version, sql) in MIGRATIONS {
@@ -757,6 +772,91 @@ impl Db {
         let token = uuid::Uuid::new_v4().to_string();
         self.store_unsubscribe_token(&token, owner);
         token
+    }
+
+    // ── 2FA operations (#965) ───────────────────────────────────────────────
+
+    pub fn upsert_2fa_config(&self, config: &TwoFactorConfig) -> Result<(), rusqlite::Error> {
+        let enabled_i = if config.enabled { 1i64 } else { 0i64 };
+        let verified_at = config.verified_at.map(|d| d.to_rfc3339());
+        let method_str = serde_json::to_string(&config.method).unwrap();
+
+        self.conn.lock().unwrap().execute(
+            r#"
+            INSERT INTO two_factor_config (vault_id, method, enabled, secret, phone, email, created_at, verified_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            ON CONFLICT(vault_id) DO UPDATE SET
+                method = excluded.method,
+                enabled = excluded.enabled,
+                secret = excluded.secret,
+                phone = excluded.phone,
+                email = excluded.email,
+                created_at = excluded.created_at,
+                verified_at = excluded.verified_at
+            "#,
+            params![
+                config.vault_id,
+                method_str,
+                enabled_i,
+                config.secret,
+                config.phone,
+                config.email,
+                config.created_at.to_rfc3339(),
+                verified_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_2fa_config(&self, vault_id: &str) -> Result<Option<TwoFactorConfig>, rusqlite::Error> {
+        let binding = self.conn.lock().unwrap();
+        let mut stmt = binding.prepare(
+            r#"
+            SELECT vault_id, method, enabled, secret, phone, email, created_at, verified_at
+            FROM two_factor_config
+            WHERE vault_id = ?1
+            "#,
+        )?;
+
+        let row_res = stmt.query_row(params![vault_id], |r| {
+            let method_str: String = r.get(1)?;
+            let method: TwoFactorMethod = serde_json::from_str(&method_str)
+                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e)))?;
+            let enabled_i: i64 = r.get(2)?;
+            let created_at_str: String = r.get(6)?;
+            let created_at = chrono::DateTime::parse_from_rfc3339(&created_at_str)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(e)))?;
+            let verified_at_str: Option<String> = r.get(7)?;
+            let verified_at = verified_at_str.and_then(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&chrono::Utc))
+            });
+
+            Ok(TwoFactorConfig {
+                vault_id: r.get(0)?,
+                method,
+                enabled: enabled_i != 0,
+                secret: r.get(3)?,
+                phone: r.get(4)?,
+                email: r.get(5)?,
+                created_at,
+                verified_at,
+            })
+        });
+
+        match row_res {
+            Ok(c) => Ok(Some(c)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn delete_2fa_config(&self, vault_id: &str) -> Result<(), rusqlite::Error> {
+        self.conn.lock().unwrap().execute(
+            "DELETE FROM two_factor_config WHERE vault_id = ?1",
+            params![vault_id],
+        )?;
+        Ok(())
     }
 }
 

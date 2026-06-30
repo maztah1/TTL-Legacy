@@ -14,6 +14,7 @@ mod error;
 mod models;
 mod routes;
 mod scheduler;
+mod two_factor;
 
 #[cfg(test)]
 mod tests;
@@ -95,6 +96,30 @@ async fn main() {
         .route(
             "/api/vaults/:vault_id/reminders",
             get(routes::list_vault_reminders),
+        )
+        .route(
+            "/api/vaults/:vault_id/2fa/status",
+            get(two_factor::get_2fa_status),
+        )
+        .route(
+            "/api/vaults/:vault_id/2fa/enable",
+            post(two_factor::enable_2fa),
+        )
+        .route(
+            "/api/vaults/:vault_id/2fa/verify",
+            post(two_factor::verify_2fa),
+        )
+        .route(
+            "/api/vaults/:vault_id/2fa/disable",
+            post(two_factor::disable_2fa),
+        )
+        .route(
+            "/api/vaults/:vault_id/2fa/challenge",
+            post(two_factor::challenge_2fa),
+        )
+        .route(
+            "/api/vaults/:vault_id/2fa/session/clear",
+            post(two_factor::clear_2fa_session),
         )
         .layer(build_cors_layer())
         .with_state(db);

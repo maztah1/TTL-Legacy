@@ -296,6 +296,11 @@ pub const WITHDRAWAL_RATE_LIMITED_TOPIC: Symbol = symbol_short!("wd_rl");
 pub const WITHDRAWAL_ESCROW_CREATED_TOPIC: Symbol = symbol_short!("wd_esc");
 pub const WITHDRAWAL_ESCROW_VERIFIED_TOPIC: Symbol = symbol_short!("wd_ver");
 
+// Issue #965: two-factor authentication events
+pub const TWO_FACTOR_ENABLED_TOPIC: Symbol = symbol_short!("2fa_en");
+pub const TWO_FACTOR_DISABLED_TOPIC: Symbol = symbol_short!("2fa_dis");
+pub const TWO_FACTOR_VERIFIED_TOPIC: Symbol = symbol_short!("2fa_vrf");
+
 /// Warning threshold in seconds. If TTL remaining < this value, ping_expiry emits an event.
 pub const EXPIRY_WARNING_THRESHOLD: u64 = 86_400; // 24 hours
 
@@ -437,6 +442,9 @@ pub enum DataKey {
     BeneficiaryAuctionCount,
     // Issue #796: open proposals tracking
     OpenProposals(u64),
+    // Issue #965: two-factor authentication
+    TwoFactorConfig(u64),
+    TwoFactorVerified(u64),
 }
 
 /// Check-in history entry for TTL prediction - Issue #482
@@ -651,6 +659,15 @@ pub struct PasskeyHash {
 pub struct BackupCode {
     pub code: String,
     pub used: bool,
+}
+
+/// Two-factor authentication configuration - Issue #965
+#[contracttype]
+#[derive(Clone)]
+pub struct TwoFactorConfigData {
+    pub enabled: bool,
+    /// 0 = TOTP, 1 = SMS, 2 = Email
+    pub method: u32,
 }
 
 /// Withdrawal approval request - Issue #404

@@ -36,6 +36,30 @@ fn test_app_with_db(db: Arc<Db>) -> Router {
             "/notifications/unsubscribe",
             get(routes::unsubscribe),
         )
+        .route(
+            "/api/vaults/:vault_id/2fa/status",
+            get(crate::two_factor::get_2fa_status),
+        )
+        .route(
+            "/api/vaults/:vault_id/2fa/enable",
+            post(crate::two_factor::enable_2fa),
+        )
+        .route(
+            "/api/vaults/:vault_id/2fa/verify",
+            post(crate::two_factor::verify_2fa),
+        )
+        .route(
+            "/api/vaults/:vault_id/2fa/disable",
+            post(crate::two_factor::disable_2fa),
+        )
+        .route(
+            "/api/vaults/:vault_id/2fa/challenge",
+            post(crate::two_factor::challenge_2fa),
+        )
+        .route(
+            "/api/vaults/:vault_id/2fa/session/clear",
+            post(crate::two_factor::clear_2fa_session),
+        )
         .with_state(db)
 }
 
@@ -436,4 +460,149 @@ mod notification_delivery_tests {
         assert!(!log.is_empty());
         assert_eq!(log[0].status, DeliveryStatus::Sent);
     }
+}
+
+// ── #965: 2FA endpoint tests ─────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_2fa_status_no_config() {
+    let app = test_app();
+    let res = get_req(app, "/api/vaults/test-vault/2fa/status").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["enabled"], false);
+    assert_eq!(json["verified"], false);
+}
+
+#[tokio::test]
+async fn test_2fa_enable_totp() {
+    let app = test_app();
+    let body = json!({"method": "totp"});
+    let res = post_json(app, "/api/vaults/v1/2fa/enable", body).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["method"], "totp");
+    assert!(json["secret"].is_string());
+    assert!(json["provisioning_uri"].is_string());
+}
+
+#[tokio::test]
+async fn test_2fa_enable_sms_missing_phone_rejected() {
+    let app = test_app();
+    let body = json!({"method": "sms"});
+    let res = post_json(app, "/api/vaults/v1/2fa/enable", body).await;
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn test_2fa_enable_sms_with_phone() {
+    let app = test_app();
+    let body = json!({"method": "sms", "phone": "+1234567890"});
+    let res = post_json(app, "/api/vaults/v1/2fa/enable", body).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["method"], "sms");
+}
+
+#[tokio::test]
+async fn test_2fa_enable_email_missing_email_rejected() {
+    let app = test_app();
+    let body = json!({"method": "email"});
+    let res = post_json(app, "/api/vaults/v1/2fa/enable", body).await;
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn test_2fa_enable_email_with_email() {
+    let app = test_app();
+    let body = json!({"method": "email", "email": "test@example.com"});
+    let res = post_json(app, "/api/vaults/v1/2fa/enable", body).await;
+    assert_eq!(res.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_2fa_verify_invalid_otp_rejected() {
+    let app = test_app();
+    // First enable TOTP
+    let body = json!({"method": "totp"});
+    post_json(&app, "/api/vaults/v1/2fa/enable", body).await;
+
+    // Try verifying with wrong code
+    let body = json!({"otp": "000000"});
+    let res = post_json(app, "/api/vaults/v1/2fa/verify", body).await;
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn test_2fa_disable() {
+    let app = test_app();
+    // Enable TOTP first
+    let body = json!({"method": "totp"});
+    post_json(&app, "/api/vaults/v1/2fa/enable", body).await;
+
+    // Disable
+    let res = post_json(app, "/api/vaults/v1/2fa/disable", json!({})).await;
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+    // Check status
+    let res = get_req(app, "/api/vaults/v1/2fa/status").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["enabled"], false);
+}
+
+#[tokio::test]
+async fn test_2fa_challenge_no_config() {
+    let app = test_app();
+    let res = post_json(app, "/api/vaults/v1/2fa/challenge", json!({})).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["enabled"], false);
+    assert_eq!(json["verified"], true); // No 2FA configured = always verified
+}
+
+#[tokio::test]
+async fn test_2fa_full_lifecycle() {
+    let app = test_app();
+
+    // 1. Status shows disabled
+    let res = get_req(&app, "/api/vaults/v1/2fa/status").await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // 2. Enable TOTP
+    let body = json!({"method": "totp"});
+    let res = post_json(&app, "/api/vaults/v1/2fa/enable", body).await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // 3. Verify with wrong OTP (should fail)
+    let body = json!({"otp": "123456"});
+    let res = post_json(&app, "/api/vaults/v1/2fa/verify", body).await;
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // 4. Challenge should show 2FA enabled but not verified
+    let res = post_json(&app, "/api/vaults/v1/2fa/challenge", json!({})).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["enabled"], true);
+    assert_eq!(json["verified"], false);
+
+    // 5. Clear session and disable
+    let res = post_json(&app, "/api/vaults/v1/2fa/session/clear", json!({})).await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let res = post_json(&app, "/api/vaults/v1/2fa/disable", json!({})).await;
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+    // 6. Status shows disabled
+    let res = get_req(app, "/api/vaults/v1/2fa/status").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["enabled"], false);
 }

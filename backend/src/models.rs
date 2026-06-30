@@ -492,3 +492,55 @@ pub struct IdempotencyRecord {
     pub created_at: DateTime<Utc>,
 }
 
+// ── 2FA models (#965) ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TwoFactorMethod {
+    Totp,
+    Sms,
+    Email,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TwoFactorConfig {
+    pub vault_id: String,
+    pub method: TwoFactorMethod,
+    pub enabled: bool,
+    pub secret: Option<String>,
+    pub phone: Option<String>,
+    pub email: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub verified_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct Enable2FARequest {
+    pub method: TwoFactorMethod,
+    pub phone: Option<String>,
+    pub email: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Verify2FARequest {
+    pub otp: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Enable2FAResponse {
+    pub vault_id: String,
+    pub method: TwoFactorMethod,
+    pub secret: Option<String>,
+    pub provisioning_uri: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TwoFactorStatusResponse {
+    pub vault_id: String,
+    pub enabled: bool,
+    pub method: Option<TwoFactorMethod>,
+    pub verified: bool,
+    pub phone: Option<String>,
+    pub email: Option<String>,
+}
+
