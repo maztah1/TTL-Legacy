@@ -96,6 +96,10 @@ async fn main() {
             "/api/vaults/:vault_id/reminders",
             get(routes::list_vault_reminders),
         )
+        .route(
+            "/api/vaults/:vault_id/analytics",
+            get(get_vault_detail_analytics_handler),
+        )
         .layer(build_cors_layer())
         .with_state(db);
 
