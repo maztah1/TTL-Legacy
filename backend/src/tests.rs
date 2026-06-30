@@ -3,6 +3,7 @@ use std::sync::Arc;
 use axum::{
     body::Body,
     http::{HeaderValue, Method, Request, StatusCode},
+    middleware,
     routing::{delete, get, post},
     Json, Router,
 };
@@ -11,11 +12,22 @@ use tower::ServiceExt;
 use tower_http::cors::CorsLayer;
 
 use crate::{
-    db::{AppState, create_vault_store, create_event_store, create_audit_store,
-           create_share_store, create_share_token_store, Db, PoolConfig},
-    models::*,
+    consensus::{ConflictStrategy, InMemoryBackend, NodeCache},
+    db::{Db, PoolConfig},
     routes,
+    AppState,
 };
+
+fn test_state(db: Arc<Db>) -> AppState {
+    db.migrate().unwrap();
+    let backend: Arc<InMemoryBackend> = Arc::new(InMemoryBackend::new());
+    let consensus = Arc::new(NodeCache::new(
+        "test-node",
+        backend,
+        ConflictStrategy::LastWriteWins,
+    ));
+    AppState { db, consensus }
+}
 
 fn test_app() -> Router {
     let db = Arc::new(Db::open(":memory:").unwrap());
@@ -31,14 +43,11 @@ fn test_app() -> Router {
     build_router(state)
 }
 
-fn test_app_with_state(state: Arc<AppState>) -> Router {
-    state.db.migrate().unwrap();
-    build_router(state)
-}
-
-fn build_router(state: Arc<AppState>) -> Router {
+fn test_app_with_db(db: Arc<Db>) -> Router {
+    let state = test_state(db);
     Router::new()
         .route("/health", get(health_handler))
+        .route("/health/consensus", get(consensus_health_handler))
         .route("/ready", get(ready_handler))
         .route(
             "/api/vaults/:vault_id/reminder-preferences",
@@ -54,31 +63,6 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/notifications/unsubscribe",
             get(routes::unsubscribe),
         )
-        // Vault share endpoints
-        .route(
-            "/api/vaults/:vault_id/share",
-            post(routes::share_vault),
-        )
-        .route(
-            "/api/vaults/:vault_id/shares",
-            get(routes::list_vault_shares),
-        )
-        .route(
-            "/api/vaults/:vault_id/share/tokens",
-            post(routes::generate_share_token).get(routes::list_share_tokens),
-        )
-        .route(
-            "/api/vaults/:vault_id/share/tokens/revoke",
-            post(routes::revoke_share_token),
-        )
-        .route(
-            "/api/shared/vaults/{token}",
-            get(routes::access_shared_vault),
-        )
-        .route(
-            "/api/shared/vaults/{token}/export",
-            get(routes::access_shared_vault_export),
-        )
         .with_state(state)
 }
 
@@ -89,13 +73,33 @@ async fn health_handler() -> Json<serde_json::Value> {
     }))
 }
 
-async fn ready_handler(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>, StatusCode> {
+async fn ready_handler(State(state): State<AppState>) -> Result<Json<serde_json::Value>, StatusCode> {
     match state.db.check_connectivity() {
         Ok(()) => Ok(Json(serde_json::json!({
             "status": "ok",
             "version": env!("CARGO_PKG_VERSION"),
             "database": "connected",
         }))),
+        Err(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
+async fn consensus_health_handler(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    match state.consensus.check_and_resolve() {
+        Ok(report) => {
+            let status = if report.consistent { "ok" } else { "degraded" };
+            Ok(Json(serde_json::json!({
+                "status": status,
+                "cache_consistent": report.consistent,
+                "node_id": report.node_id,
+                "strategy": report.strategy,
+                "conflicts_detected": report.conflicts.len(),
+                "conflicts_resolved": report.conflicts_resolved,
+                "keys_checked": report.keys_checked,
+            })))
+        }
         Err(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
     }
 }
@@ -234,6 +238,60 @@ async fn test_ready_endpoint() {
     assert_eq!(json["database"], "connected");
 }
 
+// ── #962: Multi-node consensus health check tests ────────────────────────────
+
+#[tokio::test]
+async fn test_consensus_health_endpoint_consistent() {
+    let app = test_app();
+    let res = get_req(app, "/health/consensus").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["status"], "ok");
+    assert_eq!(json["cache_consistent"], true);
+    assert_eq!(json["node_id"], "test-node");
+    assert_eq!(json["strategy"], "last_write_wins");
+    assert_eq!(json["conflicts_detected"], 0);
+}
+
+#[tokio::test]
+async fn test_consensus_health_detects_and_resolves_divergence() {
+    let db = Arc::new(Db::open(":memory:").unwrap());
+    let backend: Arc<InMemoryBackend> = Arc::new(InMemoryBackend::new());
+    let consensus = Arc::new(NodeCache::new(
+        "test-node",
+        Arc::clone(&backend),
+        ConflictStrategy::LastWriteWins,
+    ));
+    consensus.put("vault:99", "authoritative").unwrap();
+    consensus.set_local_entry(crate::consensus::CacheEntry {
+        key: "vault:99".to_string(),
+        value: "stale".to_string(),
+        node_id: "test-node".to_string(),
+        updated_at: chrono::Utc.timestamp_millis_opt(1).unwrap(),
+        version: 1,
+    });
+
+    let state = AppState {
+        db: Arc::clone(&db),
+        consensus,
+    };
+    db.migrate().unwrap();
+
+    let app = Router::new()
+        .route("/health/consensus", get(consensus_health_handler))
+        .with_state(state);
+
+    let res = get_req(app, "/health/consensus").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["status"], "degraded");
+    assert_eq!(json["cache_consistent"], false);
+    assert_eq!(json["conflicts_detected"], 1);
+    assert_eq!(json["conflicts_resolved"], 1);
+}
+
 // ── #822: Pool configuration tests ───────────────────────────────────────────
 
 #[tokio::test]
@@ -255,8 +313,7 @@ async fn test_db_open_with_pool_config() {
 
 #[tokio::test]
 async fn test_cors_allowed_origin() {
-    let db = Arc::new(Db::open(":memory:").unwrap());
-    db.migrate().unwrap();
+    let state = test_state(Arc::new(Db::open(":memory:").unwrap()));
 
     let cors = CorsLayer::new()
         .allow_origin("http://example.com".parse::<HeaderValue>().unwrap())
@@ -265,7 +322,7 @@ async fn test_cors_allowed_origin() {
     let app = Router::new()
         .route("/health", get(health_handler))
         .layer(cors)
-        .with_state(db);
+        .with_state(state);
 
     let res = app
         .oneshot(
@@ -289,8 +346,7 @@ async fn test_cors_allowed_origin() {
 
 #[tokio::test]
 async fn test_cors_rejected_origin() {
-    let db = Arc::new(Db::open(":memory:").unwrap());
-    db.migrate().unwrap();
+    let state = test_state(Arc::new(Db::open(":memory:").unwrap()));
 
     let cors = CorsLayer::new()
         .allow_origin("http://allowed.com".parse::<HeaderValue>().unwrap())
@@ -299,7 +355,7 @@ async fn test_cors_rejected_origin() {
     let app = Router::new()
         .route("/health", get(health_handler))
         .layer(cors)
-        .with_state(db);
+        .with_state(state);
 
     let res = app
         .oneshot(
@@ -481,543 +537,416 @@ mod notification_delivery_tests {
     }
 }
 
-// ── #966: Vault Sharing with Read-Only Access tests ─────────────────────────
+// ── Simulator tests ───────────────────────────────────────────────────────────
 
-#[tokio::test]
-async fn test_share_vault_endpoint_creates_share() {
-    let state = Arc::new(AppState {
-        db: Arc::new(Db::open(":memory:").unwrap()),
-        vault_store: create_vault_store(),
-        event_store: create_event_store(),
-        audit_store: create_audit_store(),
-        share_store: create_share_store(),
-        share_token_store: create_share_token_store(),
-    });
-    state.db.migrate().unwrap();
-    let app = build_router(state.clone());
-
-    // Seed a vault
-    state.vault_store.lock().unwrap().insert("vault-1".into(), Vault {
-        id: "vault-1".into(),
-        owner: "owner-1".into(),
-        beneficiary: "ben-1".into(),
-        balance: 1000,
-        check_in_interval: 86400,
-        last_check_in: Utc::now(),
-        created_at: Utc::now(),
-        status: VaultStatus::Active,
-        ttl_remaining: Some(86400),
-    });
-
-    let res = post_json(app, "/api/vaults/vault-1/share", json!({
-        "shared_with": "lawyer@example.com",
-        "permission": "view_only",
-    })).await;
-    assert_eq!(res.status(), StatusCode::OK);
-
-    let body: serde_json::Value = serde_json::from_slice(
-        &axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap()
-    ).unwrap();
-    assert_eq!(body["vault_id"], "vault-1");
-    assert_eq!(body["shared_with"], "lawyer@example.com");
-    assert_eq!(body["permission"], "view_only");
-}
-
-#[tokio::test]
-async fn test_share_vault_missing_vault_returns_error() {
-    let app = test_app();
-    let res = post_json(app, "/api/vaults/nonexistent/share", json!({
-        "shared_with": "x@example.com",
-        "permission": "view_only",
-    })).await;
-    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
-}
-
-#[tokio::test]
-async fn test_generate_share_token_creates_token_and_audit_log() {
-    let state = Arc::new(AppState {
-        db: Arc::new(Db::open(":memory:").unwrap()),
-        vault_store: create_vault_store(),
-        event_store: create_event_store(),
-        audit_store: create_audit_store(),
-        share_store: create_share_store(),
-        share_token_store: create_share_token_store(),
-    });
-    state.db.migrate().unwrap();
-    state.vault_store.lock().unwrap().insert("vault-1".into(), Vault {
-        id: "vault-1".into(),
-        owner: "owner-1".into(),
-        beneficiary: "ben-1".into(),
-        balance: 5000,
-        check_in_interval: 86400,
-        last_check_in: Utc::now(),
-        created_at: Utc::now(),
-        status: VaultStatus::Active,
-        ttl_remaining: Some(86400),
-    });
-
-    let app = build_router(state.clone());
-
-    let res = post_json(app, "/api/vaults/vault-1/share/tokens", json!({
-        "shared_with": "family@example.com",
-        "expiry_seconds": 3600,
-    })).await;
-    assert_eq!(res.status(), StatusCode::OK);
-
-    let body: serde_json::Value = serde_json::from_slice(
-        &axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap()
-    ).unwrap();
-    assert_eq!(body["share"]["vault_id"], "vault-1");
-    assert_eq!(body["share"]["shared_with"], "family@example.com");
-    assert_eq!(body["token"]["permission"], "view_only");
-    assert_eq!(body["token"]["revoked"], false);
-    assert!(body["token"]["token"].as_str().unwrap().len() > 0);
-    assert!(body["access_url"].as_str().unwrap().contains("/api/shared/vaults/"));
-
-    // Verify audit log was written
-    let audit = state.audit_store.lock().unwrap();
-    let share_event = audit.iter().find(|e| e.action == "share_token_generated");
-    assert!(share_event.is_some());
-}
-
-#[tokio::test]
-async fn test_revoke_share_token() {
-    let state = Arc::new(AppState {
-        db: Arc::new(Db::open(":memory:").unwrap()),
-        vault_store: create_vault_store(),
-        event_store: create_event_store(),
-        audit_store: create_audit_store(),
-        share_store: create_share_store(),
-        share_token_store: create_share_token_store(),
-    });
-    state.db.migrate().unwrap();
-    state.vault_store.lock().unwrap().insert("vault-1".into(), Vault {
-        id: "vault-1".into(),
-        owner: "owner-1".into(),
-        beneficiary: "ben-1".into(),
-        balance: 100,
-        check_in_interval: 86400,
-        last_check_in: Utc::now(),
-        created_at: Utc::now(),
-        status: VaultStatus::Active,
-        ttl_remaining: Some(86400),
-    });
-
-    let token_str = {
-        let token = ShareToken {
-            token: "test-token-123".into(),
-            share_id: "share-1".into(),
-            vault_id: "vault-1".into(),
-            shared_with: "reviewee@example.com".into(),
-            permission: SharePermission::ViewOnly,
-            created_at: Utc::now(),
-            expires_at: Utc::now() + chrono::Duration::days(7),
-            revoked: false,
-        };
-        let t = token.token.clone();
-        state.share_token_store.lock().unwrap().insert(t.clone(), token);
-        t
+#[cfg(test)]
+mod simulator_tests {
+    use crate::db::{create_vault_store, Db};
+    use crate::handlers::{parse_scenario_types, simulate_release_handler, simulate_scenario};
+    use crate::models::{ScenarioType, Vault, VaultStatus};
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+        routing::get,
+        Router,
     };
+    use chrono::Utc;
+    use std::sync::Arc;
+    use tower::ServiceExt;
 
-    let app = build_router(state.clone());
-
-    let res = post_json(app, "/api/vaults/vault-1/share/tokens/revoke", json!({
-        "token": token_str,
-    })).await;
-    assert_eq!(res.status(), StatusCode::OK);
-
-    let body: serde_json::Value = serde_json::from_slice(
-        &axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap()
-    ).unwrap();
-    assert_eq!(body["revoked"], true);
-
-    // Verify token is actually revoked
-    let stored = state.share_token_store.lock().unwrap();
-    let token = stored.get(&token_str).unwrap();
-    assert!(token.revoked);
-
-    // Audit log written
-    let audit = state.audit_store.lock().unwrap();
-    assert!(audit.iter().any(|e| e.action == "share_token_revoked"));
-}
-
-#[tokio::test]
-async fn test_read_only_access_via_valid_share_token() {
-    let state = Arc::new(AppState {
-        db: Arc::new(Db::open(":memory:").unwrap()),
-        vault_store: create_vault_store(),
-        event_store: create_event_store(),
-        audit_store: create_audit_store(),
-        share_store: create_share_store(),
-        share_token_store: create_share_token_store(),
-    });
-    state.db.migrate().unwrap();
-    state.vault_store.lock().unwrap().insert("vault-1".into(), Vault {
-        id: "vault-1".into(),
-        owner: "owner-1".into(),
-        beneficiary: "ben-1".into(),
-        balance: 9999,
-        check_in_interval: 86400,
-        last_check_in: Utc::now(),
-        created_at: Utc::now(),
-        status: VaultStatus::Active,
-        ttl_remaining: Some(86400),
-    });
-
-    state.share_token_store.lock().unwrap().insert("valid-token".into(), ShareToken {
-        token: "valid-token".into(),
-        share_id: "share-1".into(),
-        vault_id: "vault-1".into(),
-        shared_with: "reader@example.com".into(),
-        permission: SharePermission::ViewOnly,
-        created_at: Utc::now(),
-        expires_at: Utc::now() + chrono::Duration::days(7),
-        revoked: false,
-    });
-
-    let app = build_router(state.clone());
-
-    let res = get_req(app, "/api/shared/vaults/valid-token").await;
-    assert_eq!(res.status(), StatusCode::OK);
-
-    let body: serde_json::Value = serde_json::from_slice(
-        &axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap()
-    ).unwrap();
-    assert_eq!(body["id"], "vault-1");
-    assert_eq!(body["balance"], 9999);
-    assert_eq!(body["owner"], "owner-1");
-
-    // Audit log written
-    let audit = state.audit_store.lock().unwrap();
-    assert!(audit.iter().any(|e| e.action == "vault_accessed_via_share"));
-}
-
-#[tokio::test]
-async fn test_read_only_access_revoked_token_returns_error() {
-    let state = Arc::new(AppState {
-        db: Arc::new(Db::open(":memory:").unwrap()),
-        vault_store: create_vault_store(),
-        event_store: create_event_store(),
-        audit_store: create_audit_store(),
-        share_store: create_share_store(),
-        share_token_store: create_share_token_store(),
-    });
-    state.db.migrate().unwrap();
-    state.vault_store.lock().unwrap().insert("vault-1".into(), Vault {
-        id: "vault-1".into(),
-        owner: "owner-1".into(),
-        beneficiary: "ben-1".into(),
-        balance: 100,
-        check_in_interval: 86400,
-        last_check_in: Utc::now(),
-        created_at: Utc::now(),
-        status: VaultStatus::Active,
-        ttl_remaining: Some(86400),
-    });
-
-    state.share_token_store.lock().unwrap().insert("revoked-token".into(), ShareToken {
-        token: "revoked-token".into(),
-        share_id: "share-1".into(),
-        vault_id: "vault-1".into(),
-        shared_with: "reader@example.com".into(),
-        permission: SharePermission::ViewOnly,
-        created_at: Utc::now(),
-        expires_at: Utc::now() + chrono::Duration::days(7),
-        revoked: true,
-    });
-
-    let app = build_router(state.clone());
-    let res = get_req(app, "/api/shared/vaults/revoked-token").await;
-    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
-}
-
-#[tokio::test]
-async fn test_read_only_access_expired_token_returns_error() {
-    let state = Arc::new(AppState {
-        db: Arc::new(Db::open(":memory:").unwrap()),
-        vault_store: create_vault_store(),
-        event_store: create_event_store(),
-        audit_store: create_audit_store(),
-        share_store: create_share_store(),
-        share_token_store: create_share_token_store(),
-    });
-    state.db.migrate().unwrap();
-    state.vault_store.lock().unwrap().insert("vault-1".into(), Vault {
-        id: "vault-1".into(),
-        owner: "owner-1".into(),
-        beneficiary: "ben-1".into(),
-        balance: 100,
-        check_in_interval: 86400,
-        last_check_in: Utc::now(),
-        created_at: Utc::now(),
-        status: VaultStatus::Active,
-        ttl_remaining: Some(86400),
-    });
-
-    state.share_token_store.lock().unwrap().insert("expired-token".into(), ShareToken {
-        token: "expired-token".into(),
-        share_id: "share-1".into(),
-        vault_id: "vault-1".into(),
-        shared_with: "reader@example.com".into(),
-        permission: SharePermission::ViewOnly,
-        created_at: Utc::now(),
-        expires_at: Utc::now() - chrono::Duration::hours(1), // expired
-        revoked: false,
-    });
-
-    let app = build_router(state.clone());
-    let res = get_req(app, "/api/shared/vaults/expired-token").await;
-    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
-}
-
-#[tokio::test]
-async fn test_read_only_access_invalid_token_returns_error() {
-    let app = test_app();
-    let res = get_req(app, "/api/shared/vaults/nonexistent-token").await;
-    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
-}
-
-#[tokio::test]
-async fn test_list_share_tokens() {
-    let state = Arc::new(AppState {
-        db: Arc::new(Db::open(":memory:").unwrap()),
-        vault_store: create_vault_store(),
-        event_store: create_event_store(),
-        audit_store: create_audit_store(),
-        share_store: create_share_store(),
-        share_token_store: create_share_token_store(),
-    });
-    state.db.migrate().unwrap();
-
-    // Insert two tokens for vault-1, one token for vault-2
-    for i in 0..2 {
-        state.share_token_store.lock().unwrap().insert(format!("token-{}", i), ShareToken {
-            token: format!("token-{}", i),
-            share_id: format!("share-{}", i),
-            vault_id: "vault-1".into(),
-            shared_with: format!("user{}@example.com", i),
-            permission: SharePermission::ViewOnly,
+    fn make_vault(id: &str, check_in_interval: u64, ttl_remaining: Option<u64>) -> Vault {
+        Vault {
+            id: id.to_string(),
+            owner: "owner1".to_string(),
+            beneficiary: "beneficiary1".to_string(),
+            balance: 5000,
+            check_in_interval,
+            last_check_in: Utc::now(),
             created_at: Utc::now(),
-            expires_at: Utc::now() + chrono::Duration::days(7),
-            revoked: false,
-        });
+            status: VaultStatus::Active,
+            ttl_remaining,
+        }
     }
-    state.share_token_store.lock().unwrap().insert("other-token".into(), ShareToken {
-        token: "other-token".into(),
-        share_id: "share-other".into(),
-        vault_id: "vault-2".into(),
-        shared_with: "other@example.com".into(),
-        permission: SharePermission::ViewOnly,
-        created_at: Utc::now(),
-        expires_at: Utc::now() + chrono::Duration::days(7),
-        revoked: false,
-    });
 
-    let app = build_router(state.clone());
-    let res = get_req(app, "/api/vaults/vault-1/share/tokens").await;
-    assert_eq!(res.status(), StatusCode::OK);
+    // ── parse_scenario_types ──────────────────────────────────────────────────
 
-    let body: Vec<serde_json::Value> = serde_json::from_slice(
-        &axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap()
-    ).unwrap();
-    assert_eq!(body.len(), 2);
-}
+    #[test]
+    fn test_parse_none_returns_all_three() {
+        let result = parse_scenario_types(None);
+        assert_eq!(result.len(), 3);
+        assert!(result.contains(&ScenarioType::NoCheckIns));
+        assert!(result.contains(&ScenarioType::ConsistentCheckIns));
+        assert!(result.contains(&ScenarioType::MissedCheckInDates));
+    }
 
-#[tokio::test]
-async fn test_list_vault_shares() {
-    let state = Arc::new(AppState {
-        db: Arc::new(Db::open(":memory:").unwrap()),
-        vault_store: create_vault_store(),
-        event_store: create_event_store(),
-        audit_store: create_audit_store(),
-        share_store: create_share_store(),
-        share_token_store: create_share_token_store(),
-    });
-    state.db.migrate().unwrap();
+    #[test]
+    fn test_parse_empty_string_returns_all_three() {
+        let result = parse_scenario_types(Some(""));
+        assert_eq!(result.len(), 3);
+    }
 
-    state.share_store.lock().unwrap().push(VaultShare {
-        share_id: "s1".into(),
-        vault_id: "vault-1".into(),
-        shared_with: "a@example.com".into(),
-        permission: SharePermission::ViewOnly,
-        created_at: Utc::now(),
-    });
-    state.share_store.lock().unwrap().push(VaultShare {
-        share_id: "s2".into(),
-        vault_id: "vault-1".into(),
-        shared_with: "b@example.com".into(),
-        permission: SharePermission::Admin,
-        created_at: Utc::now(),
-    });
+    #[test]
+    fn test_parse_single_scenario() {
+        let result = parse_scenario_types(Some("no_check_ins"));
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], ScenarioType::NoCheckIns);
+    }
 
-    let app = build_router(state.clone());
-    let res = get_req(app, "/api/vaults/vault-1/shares").await;
-    assert_eq!(res.status(), StatusCode::OK);
+    #[test]
+    fn test_parse_two_scenarios() {
+        let result = parse_scenario_types(Some("no_check_ins,missed_check_in_dates"));
+        assert_eq!(result.len(), 2);
+        assert!(result.contains(&ScenarioType::NoCheckIns));
+        assert!(result.contains(&ScenarioType::MissedCheckInDates));
+    }
 
-    let body: Vec<serde_json::Value> = serde_json::from_slice(
-        &axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap()
-    ).unwrap();
-    assert_eq!(body.len(), 2);
-}
+    #[test]
+    fn test_parse_ignores_unknown_scenarios() {
+        let result = parse_scenario_types(Some("no_check_ins,unknown_scenario"));
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], ScenarioType::NoCheckIns);
+    }
 
-#[tokio::test]
-async fn test_share_token_default_expiry() {
-    let state = Arc::new(AppState {
-        db: Arc::new(Db::open(":memory:").unwrap()),
-        vault_store: create_vault_store(),
-        event_store: create_event_store(),
-        audit_store: create_audit_store(),
-        share_store: create_share_store(),
-        share_token_store: create_share_token_store(),
-    });
-    state.db.migrate().unwrap();
-    state.vault_store.lock().unwrap().insert("vault-1".into(), Vault {
-        id: "vault-1".into(),
-        owner: "owner-1".into(),
-        beneficiary: "ben-1".into(),
-        balance: 100,
-        check_in_interval: 86400,
-        last_check_in: Utc::now(),
-        created_at: Utc::now(),
-        status: VaultStatus::Active,
-        ttl_remaining: Some(86400),
-    });
+    #[test]
+    fn test_parse_all_unknown_returns_empty() {
+        let result = parse_scenario_types(Some("foo,bar,baz"));
+        assert!(result.is_empty());
+    }
 
-    let app = build_router(state.clone());
-    let res = post_json(app, "/api/vaults/vault-1/share/tokens", json!({
-        "shared_with": "test@example.com",
-    })).await;
-    assert_eq!(res.status(), StatusCode::OK);
+    #[test]
+    fn test_parse_handles_whitespace() {
+        let result = parse_scenario_types(Some(" consistent_check_ins , no_check_ins "));
+        assert_eq!(result.len(), 2);
+    }
 
-    let body: serde_json::Value = serde_json::from_slice(
-        &axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap()
-    ).unwrap();
-    let expires_at = body["token"]["expires_at"].as_str().unwrap();
-    let expires_dt = chrono::DateTime::parse_from_rfc3339(expires_at).unwrap();
-    let expected = Utc::now() + chrono::Duration::days(7);
-    // Should be roughly 7 days from now (within tolerance)
-    let diff = (expires_dt - expected).num_seconds().abs();
-    assert!(diff < 10, "expiry should be ~7 days, diff={}s", diff);
-}
+    // ── simulate_scenario — no_check_ins ────────────────────────────────────
 
-#[tokio::test]
-async fn test_share_token_with_custom_expiry() {
-    let state = Arc::new(AppState {
-        db: Arc::new(Db::open(":memory:").unwrap()),
-        vault_store: create_vault_store(),
-        event_store: create_event_store(),
-        audit_store: create_audit_store(),
-        share_store: create_share_store(),
-        share_token_store: create_share_token_store(),
-    });
-    state.db.migrate().unwrap();
-    state.vault_store.lock().unwrap().insert("vault-1".into(), Vault {
-        id: "vault-1".into(),
-        owner: "owner-1".into(),
-        beneficiary: "ben-1".into(),
-        balance: 100,
-        check_in_interval: 86400,
-        last_check_in: Utc::now(),
-        created_at: Utc::now(),
-        status: VaultStatus::Active,
-        ttl_remaining: Some(86400),
-    });
+    #[test]
+    fn test_no_check_ins_release_equals_ttl_remaining() {
+        let now = Utc::now();
+        let ttl_remaining = 86_400u64; // 1 day
+        let result = simulate_scenario(now, ScenarioType::NoCheckIns, ttl_remaining, 86_400, 1);
 
-    let app = build_router(state.clone());
-    let res = post_json(app, "/api/vaults/vault-1/share/tokens", json!({
-        "shared_with": "test@example.com",
-        "expiry_seconds": 1800,
-    })).await;
-    assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(result.scenario, ScenarioType::NoCheckIns);
+        assert_eq!(result.seconds_until_release, 86_400);
+        assert_eq!(result.confidence, "high");
 
-    let body: serde_json::Value = serde_json::from_slice(
-        &axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap()
-    ).unwrap();
-    let expires_at = body["token"]["expires_at"].as_str().unwrap();
-    let expires_dt = chrono::DateTime::parse_from_rfc3339(expires_at).unwrap();
-    let expected = Utc::now() + chrono::Duration::seconds(1800);
-    let diff = (expires_dt - expected).num_seconds().abs();
-    assert!(diff < 10, "expiry should be ~1800s, diff={}s", diff);
-}
+        // projected_release_at should be approximately now + 1 day
+        let delta = result.projected_release_at.signed_duration_since(now).num_seconds();
+        assert_eq!(delta, 86_400);
+    }
 
-#[tokio::test]
-async fn test_share_vault_with_duplicate_shares_allowed() {
-    let state = Arc::new(AppState {
-        db: Arc::new(Db::open(":memory:").unwrap()),
-        vault_store: create_vault_store(),
-        event_store: create_event_store(),
-        audit_store: create_audit_store(),
-        share_store: create_share_store(),
-        share_token_store: create_share_token_store(),
-    });
-    state.db.migrate().unwrap();
-    state.vault_store.lock().unwrap().insert("vault-1".into(), Vault {
-        id: "vault-1".into(),
-        owner: "owner-1".into(),
-        beneficiary: "ben-1".into(),
-        balance: 100,
-        check_in_interval: 86400,
-        last_check_in: Utc::now(),
-        created_at: Utc::now(),
-        status: VaultStatus::Active,
-        ttl_remaining: Some(86400),
-    });
+    #[test]
+    fn test_no_check_ins_zero_ttl_releases_now() {
+        let now = Utc::now();
+        let result = simulate_scenario(now, ScenarioType::NoCheckIns, 0, 86_400, 1);
 
-    let app = build_router(state.clone());
+        assert_eq!(result.seconds_until_release, 0);
+        // projected_release_at should be ≈ now
+        let delta = result.projected_release_at.signed_duration_since(now).num_seconds();
+        assert_eq!(delta, 0);
+    }
 
-    // Share twice with the same person
-    for _ in 0..2 {
-        let res = post_json(app.clone(), "/api/vaults/vault-1/share", json!({
-            "shared_with": "same@example.com",
-            "permission": "view_only",
-        })).await;
+    // ── simulate_scenario — consistent_check_ins ────────────────────────────
+
+    #[test]
+    fn test_consistent_check_ins_never_releases() {
+        let now = Utc::now();
+        let result =
+            simulate_scenario(now, ScenarioType::ConsistentCheckIns, 86_400, 86_400, 1);
+
+        assert_eq!(result.scenario, ScenarioType::ConsistentCheckIns);
+        // -1 signals "never"
+        assert_eq!(result.seconds_until_release, -1);
+        assert_eq!(result.confidence, "high");
+        // The far-future date should be well beyond current TTL
+        let delta = result.projected_release_at.signed_duration_since(now).num_seconds();
+        assert!(delta > 86_400 * 365); // more than a year away
+    }
+
+    // ── simulate_scenario — missed_check_in_dates ───────────────────────────
+
+    #[test]
+    fn test_missed_one_check_in_adds_one_interval() {
+        let now = Utc::now();
+        let ttl_remaining = 3600u64; // 1 hour left
+        let check_in_interval = 86_400u64; // 1 day interval
+        let result = simulate_scenario(
+            now,
+            ScenarioType::MissedCheckInDates,
+            ttl_remaining,
+            check_in_interval,
+            1,
+        );
+
+        assert_eq!(result.scenario, ScenarioType::MissedCheckInDates);
+        // 1 hour TTL + 1 day missed = 1 day + 1 hour
+        let expected = ttl_remaining + check_in_interval;
+        assert_eq!(result.seconds_until_release, expected as i64);
+        assert_eq!(result.confidence, "medium");
+    }
+
+    #[test]
+    fn test_missed_two_check_ins_adds_two_intervals() {
+        let now = Utc::now();
+        let ttl_remaining = 3600u64;
+        let check_in_interval = 86_400u64;
+        let result = simulate_scenario(
+            now,
+            ScenarioType::MissedCheckInDates,
+            ttl_remaining,
+            check_in_interval,
+            2,
+        );
+
+        let expected = ttl_remaining + 2 * check_in_interval;
+        assert_eq!(result.seconds_until_release, expected as i64);
+        assert_eq!(result.confidence, "medium");
+    }
+
+    #[test]
+    fn test_missed_three_check_ins_has_low_confidence() {
+        let now = Utc::now();
+        let result = simulate_scenario(
+            now,
+            ScenarioType::MissedCheckInDates,
+            3600,
+            86_400,
+            3,
+        );
+        assert_eq!(result.confidence, "low");
+    }
+
+    #[test]
+    fn test_missed_zero_treated_as_one() {
+        let now = Utc::now();
+        let ttl_remaining = 3600u64;
+        let check_in_interval = 86_400u64;
+        // missed_count=0 should be coerced to 1
+        let result = simulate_scenario(
+            now,
+            ScenarioType::MissedCheckInDates,
+            ttl_remaining,
+            check_in_interval,
+            0,
+        );
+        let expected = ttl_remaining + check_in_interval;
+        assert_eq!(result.seconds_until_release, expected as i64);
+    }
+
+    // ── simulate_release_handler ─────────────────────────────────────────────
+
+    #[test]
+    fn test_simulate_release_handler_vault_not_found() {
+        let store = create_vault_store();
+        let result = simulate_release_handler(
+            &store,
+            "nonexistent",
+            vec![ScenarioType::NoCheckIns],
+            1,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("nonexistent"));
+    }
+
+    #[test]
+    fn test_simulate_release_handler_returns_all_scenarios() {
+        let store = create_vault_store();
+        let vault = make_vault("vault-1", 86_400, Some(3600));
+        store.lock().unwrap().insert("vault-1".to_string(), vault);
+
+        let scenarios = vec![
+            ScenarioType::NoCheckIns,
+            ScenarioType::ConsistentCheckIns,
+            ScenarioType::MissedCheckInDates,
+        ];
+        let result = simulate_release_handler(&store, "vault-1", scenarios, 1).unwrap();
+
+        assert_eq!(result.vault_id, "vault-1");
+        assert_eq!(result.scenarios.len(), 3);
+        assert_eq!(result.check_in_interval, 86_400);
+        assert_eq!(result.current_ttl_remaining, Some(3600));
+    }
+
+    #[test]
+    fn test_simulate_release_handler_no_check_ins_matches_ttl() {
+        let store = create_vault_store();
+        let vault = make_vault("vault-2", 86_400, Some(7200));
+        store.lock().unwrap().insert("vault-2".to_string(), vault);
+
+        let result =
+            simulate_release_handler(&store, "vault-2", vec![ScenarioType::NoCheckIns], 1)
+                .unwrap();
+
+        let no_check_in_scenario = result
+            .scenarios
+            .iter()
+            .find(|s| s.scenario == ScenarioType::NoCheckIns)
+            .unwrap();
+
+        assert_eq!(no_check_in_scenario.seconds_until_release, 7200);
+        assert_eq!(no_check_in_scenario.confidence, "high");
+    }
+
+    #[test]
+    fn test_simulate_release_handler_fallback_ttl_computation() {
+        // When ttl_remaining is None, the handler computes TTL from last_check_in
+        let store = create_vault_store();
+        let mut vault = make_vault("vault-3", 3600, None); // 1 hour interval, no stored TTL
+        // last_check_in is Utc::now() so TTL should be close to 3600 seconds
+        vault.ttl_remaining = None;
+        store.lock().unwrap().insert("vault-3".to_string(), vault);
+
+        let result =
+            simulate_release_handler(&store, "vault-3", vec![ScenarioType::NoCheckIns], 1)
+                .unwrap();
+
+        let no_check_in = result
+            .scenarios
+            .iter()
+            .find(|s| s.scenario == ScenarioType::NoCheckIns)
+            .unwrap();
+
+        // TTL should be ≈3600 seconds (last_check_in just happened)
+        assert!(no_check_in.seconds_until_release >= 3590);
+        assert!(no_check_in.seconds_until_release <= 3600);
+    }
+
+    #[test]
+    fn test_simulate_release_handler_single_scenario_subset() {
+        let store = create_vault_store();
+        let vault = make_vault("vault-4", 86_400, Some(43200));
+        store.lock().unwrap().insert("vault-4".to_string(), vault);
+
+        let result = simulate_release_handler(
+            &store,
+            "vault-4",
+            vec![ScenarioType::MissedCheckInDates],
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(result.scenarios.len(), 1);
+        let s = &result.scenarios[0];
+        assert_eq!(s.scenario, ScenarioType::MissedCheckInDates);
+        // 43200 + 2 * 86400 = 43200 + 172800 = 216000
+        assert_eq!(s.seconds_until_release, 43200 + 2 * 86400);
+    }
+
+    // ── HTTP endpoint test ────────────────────────────────────────────────────
+
+    fn simulator_app() -> Router {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        db.migrate().unwrap();
+
+        // Pre-populate the in-memory vault store
+        db.insert_vault(make_vault("vault-http-1", 86_400, Some(3600)));
+
+        Router::new()
+            .route(
+                "/api/vaults/:vault_id/simulate-release",
+                get(crate::routes::simulate_release),
+            )
+            .with_state(db)
+    }
+
+    #[tokio::test]
+    async fn test_simulate_release_http_200() {
+        let app = simulator_app();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/vaults/vault-http-1/simulate-release")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
         assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["vault_id"], "vault-http-1");
+        assert_eq!(json["scenarios"].as_array().unwrap().len(), 3);
+        assert_eq!(json["check_in_interval"], 86400);
     }
 
-    let shares = state.share_store.lock().unwrap();
-    assert_eq!(shares.len(), 2);
-}
+    #[tokio::test]
+    async fn test_simulate_release_http_with_scenario_filter() {
+        let app = simulator_app();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/vaults/vault-http-1/simulate-release?scenarios=no_check_ins")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
-#[tokio::test]
-async fn test_audit_log_entries_for_share_events() {
-    let state = Arc::new(AppState {
-        db: Arc::new(Db::open(":memory:").unwrap()),
-        vault_store: create_vault_store(),
-        event_store: create_event_store(),
-        audit_store: create_audit_store(),
-        share_store: create_share_store(),
-        share_token_store: create_share_token_store(),
-    });
-    state.db.migrate().unwrap();
-    state.vault_store.lock().unwrap().insert("vault-1".into(), Vault {
-        id: "vault-1".into(),
-        owner: "owner-1".into(),
-        beneficiary: "ben-1".into(),
-        balance: 100,
-        check_in_interval: 86400,
-        last_check_in: Utc::now(),
-        created_at: Utc::now(),
-        status: VaultStatus::Active,
-        ttl_remaining: Some(86400),
-    });
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-    // Perform share
-    crate::handlers::share_vault_handler(
-        &state.vault_store,
-        &state.share_store,
-        &state.share_token_store,
-        &state.audit_store,
-        "vault-1",
-        ShareRequest {
-            shared_with: "audit-test@example.com".into(),
-            permission: SharePermission::ViewOnly,
-        },
-    ).unwrap();
+        let scenarios = json["scenarios"].as_array().unwrap();
+        assert_eq!(scenarios.len(), 1);
+        assert_eq!(scenarios[0]["scenario"], "no_check_ins");
+    }
 
-    // Verify audit entry
-    let audit = state.audit_store.lock().unwrap();
-    let entry = audit.iter().find(|e| e.action == "vault_shared").unwrap();
-    assert_eq!(entry.actor, "owner-1");
-    assert_eq!(entry.details["vault_id"], "vault-1");
-    assert_eq!(entry.details["shared_with"], "audit-test@example.com");
+    #[tokio::test]
+    async fn test_simulate_release_http_404_unknown_vault() {
+        let app = simulator_app();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/vaults/doesnotexist/simulate-release")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_simulate_release_http_422_bad_scenario() {
+        let app = simulator_app();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/vaults/vault-http-1/simulate-release?scenarios=bad_scenario")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn test_simulate_release_http_with_missed_count() {
+        let app = simulator_app();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/vaults/vault-http-1/simulate-release?scenarios=missed_check_in_dates&missed_count=3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let scenarios = json["scenarios"].as_array().unwrap();
+        assert_eq!(scenarios[0]["scenario"], "missed_check_in_dates");
+        // 3600 TTL + 3 * 86400 missed = 3600 + 259200 = 262800
+        assert_eq!(scenarios[0]["seconds_until_release"], 3600 + 3 * 86400);
+        assert_eq!(scenarios[0]["confidence"], "low");
+    }
 }

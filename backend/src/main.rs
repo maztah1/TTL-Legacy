@@ -1,7 +1,8 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
-    extract::State,
+    extract::{FromRef, State},
     http::{HeaderValue, Method, StatusCode},
     routing::{delete, get, post},
     Json, Router,
@@ -9,18 +10,34 @@ use axum::{
 use tower_http::cors::CorsLayer;
 use tracing_subscriber::EnvFilter;
 
+mod consensus;
 mod db;
 mod error;
 mod handlers;
 mod models;
+mod notifications;
 mod routes;
 mod scheduler;
+mod two_factor;
 
 #[cfg(test)]
 mod tests;
 
+pub use consensus::NodeCache;
 pub use db::Db;
 pub use db::AppState;
+
+#[derive(Clone)]
+pub struct AppState {
+    pub db: Arc<Db>,
+    pub consensus: Arc<NodeCache>,
+}
+
+impl FromRef<AppState> for Arc<Db> {
+    fn from_ref(state: &AppState) -> Arc<Db> {
+        Arc::clone(&state.db)
+    }
+}
 
 fn build_cors_layer() -> CorsLayer {
     let allowed_origins = std::env::var("ALLOWED_ORIGINS").unwrap_or_default();
@@ -52,13 +69,35 @@ async fn health_handler() -> Json<serde_json::Value> {
     }))
 }
 
-async fn ready_handler(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>, StatusCode> {
+async fn ready_handler(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
     match state.db.check_connectivity() {
         Ok(()) => Ok(Json(serde_json::json!({
             "status": "ok",
             "version": env!("CARGO_PKG_VERSION"),
             "database": "connected",
         }))),
+        Err(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
+async fn consensus_health_handler(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    match state.consensus.check_and_resolve() {
+        Ok(report) => {
+            let status = if report.consistent { "ok" } else { "degraded" };
+            Ok(Json(serde_json::json!({
+                "status": status,
+                "cache_consistent": report.consistent,
+                "node_id": report.node_id,
+                "strategy": report.strategy,
+                "conflicts_detected": report.conflicts.len(),
+                "conflicts_resolved": report.conflicts_resolved,
+                "keys_checked": report.keys_checked,
+            })))
+        }
         Err(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
     }
 }
@@ -80,22 +119,26 @@ async fn main() {
     let db = Arc::new(Db::open_with_pool_config(":memory:", &pool_config).expect("failed to open db"));
     db.migrate().expect("migration failed");
 
+    let consensus = NodeCache::from_env();
+    tracing::info!(
+        node_id = consensus.node_id(),
+        strategy = ?consensus.strategy(),
+        "consensus cache initialized"
+    );
+
     let scheduler_db = Arc::clone(&db);
     tokio::spawn(async move {
         scheduler::run(scheduler_db).await;
     });
 
-    let state = Arc::new(AppState {
-        db: Arc::clone(&db),
-        vault_store: db::create_vault_store(),
-        event_store: db::create_event_store(),
-        audit_store: db::create_audit_store(),
-        share_store: db::create_share_store(),
-        share_token_store: db::create_share_token_store(),
-    });
+    let state = AppState {
+        db,
+        consensus,
+    };
 
     let app = Router::new()
         .route("/health", get(health_handler))
+        .route("/health/consensus", get(consensus_health_handler))
         .route("/ready", get(ready_handler))
         .route(
             "/api/vaults/:vault_id/reminder-preferences",
@@ -107,31 +150,9 @@ async fn main() {
             "/api/vaults/:vault_id/reminders",
             get(routes::list_vault_reminders),
         )
-        // Vault sharing endpoints
         .route(
-            "/api/vaults/:vault_id/share",
-            post(routes::share_vault),
-        )
-        .route(
-            "/api/vaults/:vault_id/shares",
-            get(routes::list_vault_shares),
-        )
-        .route(
-            "/api/vaults/:vault_id/share/tokens",
-            post(routes::generate_share_token).get(routes::list_share_tokens),
-        )
-        .route(
-            "/api/vaults/:vault_id/share/tokens/revoke",
-            post(routes::revoke_share_token),
-        )
-        // Read-only shared vault access (no auth required — uses token)
-        .route(
-            "/api/shared/vaults/{token}",
-            get(routes::access_shared_vault),
-        )
-        .route(
-            "/api/shared/vaults/{token}/export",
-            get(routes::access_shared_vault_export),
+            "/api/vaults/:vault_id/simulate-release",
+            get(routes::simulate_release),
         )
         .layer(build_cors_layer())
         .with_state(state);

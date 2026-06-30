@@ -8,13 +8,11 @@ use axum::{
 use serde::Deserialize;
 
 use crate::{
-    db::AppState,
+    audit,
+    db::Db,
     error::AppError,
-    handlers,
-    models::{
-        GenerateTokenRequest, ReminderPreferences, RevokeTokenRequest,
-        SetPreferencesRequest, ShareRequest, ShareTokenResponse, VaultShare, ShareToken,
-    },
+    handlers::{parse_scenario_types, simulate_release_handler},
+    models::{ReminderPreferences, SetPreferencesRequest, SimulateReleaseQuery, SimulateReleaseResponse},
 };
 
 #[derive(Deserialize)]
@@ -124,120 +122,31 @@ pub async fn unsubscribe(
     }
 }
 
-// ── Vault Sharing endpoints ─────────────────────────────────────────────────
 
-/// POST /api/vaults/{vault_id}/share
-pub async fn share_vault(
-    State(state): State<Arc<AppState>>,
+// ── Release Simulator endpoint ────────────────────────────────────────────────
+
+/// GET /api/vaults/:vault_id/simulate-release?scenarios=no_check_ins,consistent_check_ins,missed_check_in_dates&missed_count=2
+pub async fn simulate_release(
+    State(db): State<Arc<Db>>,
     Path(vault_id): Path<String>,
-    Json(body): Json<ShareRequest>,
-) -> Result<Json<VaultShare>, AppError> {
-    handlers::share_vault_handler(
-        &state.vault_store,
-        &state.share_store,
-        &state.share_token_store,
-        &state.audit_store,
-        &vault_id,
-        body,
-    )
-    .map(Json)
-    .map_err(|e| AppError::InvalidInput(e))
-}
-
-/// POST /api/vaults/{vault_id}/share/tokens
-pub async fn generate_share_token(
-    State(state): State<Arc<AppState>>,
-    Path(vault_id): Path<String>,
-    Json(body): Json<GenerateTokenRequest>,
-) -> Result<Json<ShareTokenResponse>, AppError> {
-    handlers::generate_share_token_handler(
-        &state.vault_store,
-        &state.share_store,
-        &state.share_token_store,
-        &state.audit_store,
-        &vault_id,
-        body,
-    )
-    .map(Json)
-    .map_err(|e| AppError::InvalidInput(e))
-}
-
-/// POST /api/vaults/{vault_id}/share/tokens/revoke
-pub async fn revoke_share_token(
-    State(state): State<Arc<AppState>>,
-    Path(vault_id): Path<String>,
-    Json(body): Json<RevokeTokenRequest>,
-) -> Result<Json<ShareToken>, AppError> {
-    handlers::revoke_share_token_handler(
-        &state.vault_store,
-        &state.share_token_store,
-        &state.audit_store,
-        &vault_id,
-        body,
-    )
-    .map(Json)
-    .map_err(|e| AppError::InvalidInput(e))
-}
-
-/// GET /api/vaults/{vault_id}/shares
-pub async fn list_vault_shares(
-    State(state): State<Arc<AppState>>,
-    Path(vault_id): Path<String>,
-) -> Result<Json<Vec<VaultShare>>, AppError> {
-    let shares = handlers::list_vault_shares_handler(&state.share_store, &vault_id);
-    Ok(Json(shares))
-}
-
-/// GET /api/vaults/{vault_id}/share/tokens
-pub async fn list_share_tokens(
-    State(state): State<Arc<AppState>>,
-    Path(vault_id): Path<String>,
-) -> Result<Json<Vec<ShareToken>>, AppError> {
-    let tokens = handlers::list_share_tokens_handler(&state.share_token_store, &vault_id);
-    Ok(Json(tokens))
-}
-
-/// GET /api/shared/vaults/{token} — read-only vault access via share token
-pub async fn access_shared_vault(
-    State(state): State<Arc<AppState>>,
-    Path(token): Path<String>,
-) -> Result<Json<crate::models::Vault>, AppError> {
-    handlers::access_vault_via_share_handler(
-        &state.vault_store,
-        &state.share_token_store,
-        &state.audit_store,
-        &token,
-    )
-    .map(Json)
-    .map_err(|e| AppError::InvalidInput(e))
-}
-
-#[derive(Deserialize)]
-pub struct ExportFormatQuery {
-    pub format: Option<String>,
-}
-
-/// GET /api/shared/vaults/{token}/export — read-only export via share token
-pub async fn access_shared_vault_export(
-    State(state): State<Arc<AppState>>,
-    Path(token): Path<String>,
-    Query(query): Query<ExportFormatQuery>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let fmt = query.format.as_deref().unwrap_or("json");
-    let result = handlers::access_vault_export_via_share_handler(
-        &state.vault_store,
-        &state.event_store,
-        &state.audit_store,
-        &state.share_token_store,
-        &token,
-        fmt,
-    )
-    .map_err(|e| AppError::InvalidInput(e))?;
-
-    // Try to parse as JSON; otherwise return as raw text
-    match serde_json::from_str::<serde_json::Value>(&result) {
-        Ok(val) => Ok(Json(val)),
-        Err(_) => Ok(Json(serde_json::json!({ "data": result }))),
+    Query(query): Query<SimulateReleaseQuery>,
+) -> Result<Json<SimulateReleaseResponse>, AppError> {
+    let scenarios = parse_scenario_types(query.scenarios.as_deref());
+    if scenarios.is_empty() {
+        return Err(AppError::InvalidInput(
+            "No valid scenarios requested. Use: no_check_ins, consistent_check_ins, missed_check_in_dates".into(),
+        ));
     }
-}
 
+    let missed_count = query.missed_count.unwrap_or(1);
+
+    let result = simulate_release_handler(
+        &db.vault_store,
+        &vault_id,
+        scenarios,
+        missed_count,
+    )
+    .map_err(|_| AppError::NotFound)?;
+
+    Ok(Json(result))
+}
