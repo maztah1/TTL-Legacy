@@ -11,6 +11,7 @@ use types::{
     BeneficiaryEntry, DataKey, ReleaseEvent, ReleaseStatus, ReleaseCondition, Vault, VestingSchedule,
     VestingPenaltyConfig, VestingPendingClaim,
     MilestoneEntry, MilestoneVestingSchedule,
+    VaultSnapshot,
     PasskeyHash, BackupCode, DisputeStatus, WithdrawalScheduleEntry, ConditionalAcceptanceEntry,
     ArchivedVaultInfo, OwnershipTransferRequest, PendingBeneficiaryUpdate, AuditEntry, MultiSigConfig, MultiSigProposal,
     MultiSigOperation, ProposalStatus, PasskeyUsageEntry, BeneficiaryStatus, BridgeConfig,
@@ -238,6 +239,7 @@ pub enum ContractError {
     AuctionEnded = 80,
     AuctionNotEnded = 81,
     InvalidVestingSchedule = 82,
+    SnapshotNotFound = 83,
 }
 
 #[contract]
@@ -4461,6 +4463,54 @@ impl TtlVaultContract {
     /// Panics if the vault does not exist (use `vault_exists` to check first)
     pub fn get_vault(env: Env, vault_id: u64) -> Vault {
         Self::load_vault(&env, vault_id)
+    }
+
+    /// Captures the state of a vault at a specific point in time.
+    /// Anyone can call this function.
+    pub fn create_vault_snapshot(env: Env, vault_id: u64) -> Bytes {
+        let vault = Self::load_vault(&env, vault_id);
+        let timestamp = env.ledger().timestamp();
+        let vault_bytes = vault.to_xdr(&env);
+        let content_hash = env.crypto().sha256(&vault_bytes);
+
+        let snapshot = VaultSnapshot {
+            vault,
+            timestamp,
+            content_hash: content_hash.clone(),
+        };
+
+        env.storage().persistent().set(&DataKey::VaultSnapshot(vault_id, timestamp), &snapshot);
+
+        // Update the list of snapshot timestamps for this vault
+        let mut timestamps: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VaultSnapshotTimestamps(vault_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        timestamps.push_back(timestamp);
+
+        // Limit snapshots to the last 1000 per vault
+        if timestamps.len() > 1000 {
+            if let Some(oldest_timestamp) = timestamps.first() {
+                env.storage().persistent().remove(&DataKey::VaultSnapshot(vault_id, oldest_timestamp));
+                timestamps.remove(0);
+            }
+        }
+
+        env.storage().persistent().set(&DataKey::VaultSnapshotTimestamps(vault_id), &timestamps);
+
+        content_hash.into()
+    }
+
+    /// Retrieves a captured vault state at a specific timestamp.
+    pub fn get_vault_snapshot(env: Env, vault_id: u64, timestamp: u64) -> Vault {
+        let snapshot: VaultSnapshot = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VaultSnapshot(vault_id, timestamp))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::SnapshotNotFound));
+        snapshot.vault
     }
 
     /// Returns the last check-in timestamp for a vault.

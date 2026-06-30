@@ -368,6 +368,8 @@ pub enum DataKey {
     OwnerVaultCount(Address),
     // Issue #472: state transition audit trail
     StateTransitionLog(u64),
+    VaultSnapshot(u64, u64),
+    VaultSnapshotTimestamps(u64),
     // Issue #482: TTL prediction history
     CheckInHistory(u64),
     CheckInStreak(u64),
@@ -1409,3 +1411,13 @@ pub struct ProtocolConfig {
     pub max_ttl_seconds: u64,
     pub ttl_decay_rate: u32,
 }
+
+/// Vault state snapshot at a specific point in time.
+#[contracttype]
+#[derive(Clone)]
+pub struct VaultSnapshot {
+    pub vault: Vault,
+    pub timestamp: u64,
+    pub content_hash: BytesN<32>,
+}
+

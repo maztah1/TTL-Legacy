@@ -6293,3 +6293,61 @@ fn test_trigger_release_with_50_beneficiaries() {
     // Last beneficiary absorbs any dust
     assert!(token_client.balance(&addresses[49]) >= per_beneficiary);
 }
+
+#[test]
+fn test_vault_snapshots() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+
+    // Get snapshot at non-existent timestamp should fail
+    let err = client.try_get_vault_snapshot(&vault_id, &0u64).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(ContractError::SnapshotNotFound as u32));
+
+    // Create a snapshot
+    let now1 = env.ledger().timestamp();
+    let hash1 = client.create_vault_snapshot(&vault_id);
+    assert_eq!(hash1.len(), 32);
+
+    // Retrieve snapshot
+    let snap1 = client.get_vault_snapshot(&vault_id, &now1);
+    assert_eq!(snap1.owner, owner);
+    assert_eq!(snap1.balance, 0i128);
+
+    // Change vault state by checking in after advancing time
+    env.ledger().with_mut(|l| l.timestamp += 200);
+    let now2 = env.ledger().timestamp();
+    // Use a dummy passkey hash
+    let dummy_hash = BytesN::from_array(&env, &[0u8; 32]);
+    client.check_in(&vault_id, &owner, &dummy_hash);
+
+    // Take another snapshot
+    let hash2 = client.create_vault_snapshot(&vault_id);
+    assert!(hash1 != hash2);
+
+    // Retrieve both and verify they are different
+    let snap1_again = client.get_vault_snapshot(&vault_id, &now1);
+    let snap2 = client.get_vault_snapshot(&vault_id, &now2);
+    assert_ne!(snap1_again.last_check_in, snap2.last_check_in);
+
+    // Test the 1000 snapshots limit
+    // We will create 1005 snapshots. Since 1005 > 1000, the first few should be deleted.
+    let mut timestamps = soroban_sdk::Vec::new(&env);
+    for _ in 0..1005 {
+        env.ledger().with_mut(|l| l.timestamp += 1);
+        let ts = env.ledger().timestamp();
+        timestamps.push_back(ts);
+        client.create_vault_snapshot(&vault_id);
+    }
+
+    // The very first of the 1005 snapshots (index 0) should be deleted
+    let ts_deleted = timestamps.get(0).unwrap();
+    let err_deleted = client.try_get_vault_snapshot(&vault_id, &ts_deleted).unwrap_err().unwrap();
+    assert_eq!(err_deleted, soroban_sdk::Error::from_contract_error(ContractError::SnapshotNotFound as u32));
+
+    // The last snapshot should be retrievable
+    let ts_latest = timestamps.get(1004).unwrap();
+    let snap_latest = client.get_vault_snapshot(&vault_id, &ts_latest);
+    assert_eq!(snap_latest.owner, owner);
+}
+
