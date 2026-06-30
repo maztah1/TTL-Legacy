@@ -10,8 +10,9 @@ use serde::Deserialize;
 use crate::{
     audit,
     db::Db,
-    error::{ApiError, AppError},
-    models::{AuditLogEntry, AuditLogQuery, ReminderPreferences, SetPreferencesRequest},
+    error::AppError,
+    handlers::{parse_scenario_types, simulate_release_handler},
+    models::{ReminderPreferences, SetPreferencesRequest, SimulateReleaseQuery, SimulateReleaseResponse},
 };
 
 #[derive(Deserialize)]
@@ -117,61 +118,31 @@ pub async fn unsubscribe(
     }
 }
 
-// ── Audit Log endpoint (#961) ──────────────────────────────────────────────
 
-#[derive(Deserialize)]
-pub struct AuditLogParams {
-    pub user_id: Option<String>,
-    pub action: Option<String>,
-    pub resource: Option<String>,
-    pub result: Option<String>,
-    pub after: Option<String>,
-    pub before: Option<String>,
-    pub limit: Option<i64>,
-    pub offset: Option<i64>,
-}
+// ── Release Simulator endpoint ────────────────────────────────────────────────
 
-/// GET /api/audit-logs
-///
-/// Returns audit log entries with optional filtering.
-/// Requires `Authorization: Bearer <ADMIN_API_KEY>`.
-pub async fn get_audit_logs(
+/// GET /api/vaults/:vault_id/simulate-release?scenarios=no_check_ins,consistent_check_ins,missed_check_in_dates&missed_count=2
+pub async fn simulate_release(
     State(db): State<Arc<Db>>,
-    headers: HeaderMap,
-    Query(params): Query<AuditLogParams>,
-) -> Result<Json<Vec<AuditLogEntry>>, ApiError> {
-    audit::authorize_admin(&headers)?;
+    Path(vault_id): Path<String>,
+    Query(query): Query<SimulateReleaseQuery>,
+) -> Result<Json<SimulateReleaseResponse>, AppError> {
+    let scenarios = parse_scenario_types(query.scenarios.as_deref());
+    if scenarios.is_empty() {
+        return Err(AppError::InvalidInput(
+            "No valid scenarios requested. Use: no_check_ins, consistent_check_ins, missed_check_in_dates".into(),
+        ));
+    }
 
-    let after = params
-        .after
-        .as_ref()
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .map(|dt| dt.with_timezone(&chrono::Utc));
-    let before = params
-        .before
-        .as_ref()
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .map(|dt| dt.with_timezone(&chrono::Utc));
+    let missed_count = query.missed_count.unwrap_or(1);
 
-    let query = AuditLogQuery {
-        user_id: params.user_id,
-        action: params.action,
-        resource: params.resource,
-        result: params.result,
-        after,
-        before,
-        limit: params.limit,
-        offset: params.offset,
-    };
+    let result = simulate_release_handler(
+        &db.vault_store,
+        &vault_id,
+        scenarios,
+        missed_count,
+    )
+    .map_err(|_| AppError::NotFound)?;
 
-    let entries = db.query_audit_logs(&query).map_err(|e| {
-        ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal_error",
-            format!("failed to query audit logs: {e}"),
-        )
-    })?;
-
-    Ok(Json(entries))
+    Ok(Json(result))
 }
-
